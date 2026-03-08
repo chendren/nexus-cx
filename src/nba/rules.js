@@ -20,7 +20,21 @@
  * @see {@link module:nexus-cx/nba/engine} NBA engine (consumer)
  */
 
+/**
+ * Ordered array of deterministic business rules evaluated by the NBA engine.
+ * Rules are sorted by priority (highest first) and all matching rules fire
+ * simultaneously — the engine deduplicates and ranks the resulting actions.
+ *
+ * Priority bands:
+ *   90-100: Critical retention and complaint handling
+ *   74-88:  SLA recovery, VIP routing, cross-channel frustration, repeated issues
+ *   50-60:  Proactive opportunities (upgrades, onboarding, deflection)
+ *   30-40:  Low-urgency self-service and feedback follow-ups
+ *
+ * @type {Array<{ id: string, name: string, priority: number, condition: Function, action: { type: string, urgency: string, content: string, params: Object } }>}
+ */
 const RULES = [
+  // ─── Critical Retention (priority 95-100) ─────────────────────────────
   {
     id: 'CHURN_RISK_HIGH',
     name: 'High Churn Risk Intervention',
@@ -49,6 +63,7 @@ const RULES = [
       params: { max_discount_pct: 50, allow_free_upgrade: true }
     }
   },
+  // ─── VIP and Complaint Handling (priority 85-92) ────────────────────────
   {
     id: 'VIP_PRIORITY_ROUTING',
     name: 'VIP Priority Routing',
@@ -63,6 +78,7 @@ const RULES = [
       params: { route_senior: true, premium_queue: true }
     }
   },
+  // ─── SLA and Escalation Recovery (priority 74-88) ───────────────────────
   {
     id: 'SLA_AT_RISK',
     name: 'SLA At Risk Recovery',
@@ -120,6 +136,7 @@ const RULES = [
       params: { proactive_follow_up: true, waive_fee_review: true }
     }
   },
+  // ─── Proactive Opportunities (priority 50-60) ──────────────────────────
   {
     id: 'UPGRADE_OPPORTUNITY',
     name: 'Upgrade Opportunity',
@@ -193,6 +210,7 @@ const RULES = [
       params: { offer_help_center: true, offer_virtual_assistant: true }
     }
   },
+  // ─── Self-Service and Feedback (priority 30-40) ─────────────────────────
   {
     id: 'PASSWORD_RESET_ASSIST',
     name: 'Password Reset Self-Service',

@@ -41,27 +41,66 @@ const { createLogger } = require('./logger');
 
 const log = createLogger('pipeline');
 
+/**
+ * Central orchestrator that wires the Event Fabric to all five processing layers
+ * and manages the two-phase processing model: synchronous deterministic pipeline
+ * followed by non-blocking async LLM enrichment.
+ *
+ * @class
+ */
 class Pipeline {
   constructor() {
+    /** @type {EventFabric} Event streaming backbone */
     this.fabric = getFabric();
-    this.classifier = null; // Initialized async in start()
+
+    /** @type {?Classifier} Initialized asynchronously in start() because embedding index build is async */
+    this.classifier = null;
+
+    /** @type {IdentityResolver} Cross-channel identity resolution */
     this.resolver = getResolver();
+
+    /** @type {JourneyEngine} Finite state machine journey tracker */
     this.journeyEngine = getJourneyEngine();
+
+    /** @type {NBAEngine} Next-best-action recommendation engine */
     this.nbaEngine = getNBAEngine();
+
+    /** @type {MetricsEngine} Real-time analytics aggregation */
     this.metrics = getMetrics();
+
+    /** @type {boolean} Whether the pipeline is accepting events */
     this.isRunning = false;
+
+    /** @type {number} Total events processed through the synchronous pipeline */
     this.processedCount = 0;
+
+    /** @type {number} Total events enriched by the async LLM phase */
     this.llmEnrichmentCount = 0;
+
+    /** @type {Map<string, Object>} In-memory cache of LLM enrichment results, keyed by event_id */
     this.analysisStore = new Map();
+
+    /** @type {number} Maximum enrichment records to retain before eviction */
     this.analysisStoreMax = config.ANALYSIS_STORE_MAX;
+
+    /** @type {Object} Rolling average latency statistics per pipeline stage */
     this.latencyStats = { identity: 0, classify: 0, journey: 0, nba: 0, metrics: 0, total: 0, count: 0 };
+
+    /** @type {?Object} Cached prepared statement for dead letter persistence */
     this._deadLetterStmt = null;
   }
 
+  /**
+   * Initialize the pipeline by building the classifier's embedding index
+   * (async operation) and marking the pipeline as ready for event ingestion.
+   * Idempotent — calling start() on an already-running pipeline is a no-op.
+   *
+   * @returns {Promise<Pipeline>} This pipeline instance for chaining
+   */
   async start() {
     if (this.isRunning) return;
 
-    // Initialize classifier (async — builds embedding index)
+    // Initialize classifier (async — builds embedding index from Ollama embeddings or TF-IDF fallback)
     this.classifier = await getClassifier();
 
     this.isRunning = true;
@@ -69,6 +108,25 @@ class Pipeline {
     return this;
   }
 
+  /**
+   * Execute the full synchronous processing pipeline on a single event.
+   *
+   * **Phase 1 stages (synchronous, deterministic):**
+   *   1. Identity resolution — match/create unified customer profile
+   *   2. Classification — semantic embedding or TF-IDF intent classification + deterministic analysis
+   *   3. Journey state machine — advance journey state, detect stuck/SLA issues
+   *   4. NBA evaluation — deterministic rules + ML scoring + channel routing
+   *   5. Metrics recording — counters, time series, event archival
+   *
+   * **Phase 2 (async, non-blocking):**
+   *   LLM enrichment fires after Phase 1 completes and does not block the response.
+   *
+   * Failed events are captured in the dead letter store for later inspection.
+   *
+   * @param {Object} event - Normalized event from the schema layer
+   * @returns {Promise<void>}
+   * @private
+   */
   async _processEvent(event) {
     try {
       const t0 = performance.now();
@@ -270,6 +328,15 @@ class Pipeline {
     }
   }
 
+  /**
+   * Update the rolling average latency statistics using an incremental mean.
+   * Avoids storing all historical values — only the running average and count.
+   *
+   * @param {number} identityMs - Identity resolution latency in milliseconds
+   * @param {number} totalMs - Total pipeline processing latency in milliseconds
+   * @returns {void}
+   * @private
+   */
   _updateLatency(identityMs, totalMs) {
     const n = this.latencyStats.count;
     this.latencyStats.identity = (this.latencyStats.identity * n + identityMs) / (n + 1);
@@ -277,6 +344,11 @@ class Pipeline {
     this.latencyStats.count = n + 1;
   }
 
+  /**
+   * Return the current rolling average latency statistics.
+   *
+   * @returns {{ avgIdentityMs: number, avgTotalMs: number, eventsProcessed: number }}
+   */
   getLatencyStats() {
     return {
       avgIdentityMs: Math.round(this.latencyStats.identity * 100) / 100,
@@ -285,6 +357,16 @@ class Pipeline {
     };
   }
 
+  /**
+   * Capture a failed event in the `dead_letters` SQLite table for post-mortem
+   * analysis. Stores the event_id, error message, and a truncated payload.
+   * Silent failure — dead letter capture should never throw and disrupt the pipeline.
+   *
+   * @param {Object} event - The event that failed processing
+   * @param {Error} err - The error that caused the failure
+   * @returns {void}
+   * @private
+   */
   _captureDeadLetter(event, err) {
     if (!config.PERSIST) return;
     try {
@@ -304,21 +386,50 @@ class Pipeline {
     } catch {}
   }
 
+  /**
+   * Public entry point for event ingestion. Publishes the raw event to the
+   * Event Fabric, then runs the full processing pipeline.
+   *
+   * @param {Object} event - Normalized event created by the schema layer
+   * @returns {Promise<Object>} The fully-enriched event (mutated in place)
+   */
   async ingest(event) {
     this.fabric.publish('raw-events', event);
     await this._processEvent(event);
     return event;
   }
 
+  /**
+   * Retrieve the LLM enrichment result for a specific event.
+   *
+   * @param {string} eventId - The event_id to look up
+   * @returns {?Object} Enrichment record, or null if not found
+   */
   getAnalysis(eventId) {
     return this.analysisStore.get(eventId) || null;
   }
 
+  /**
+   * Retrieve the most recent LLM enrichment results.
+   *
+   * @param {number} [limit=20] - Maximum number of results to return
+   * @returns {Object[]} Most recent enrichment records
+   */
   getRecentAnalyses(limit = 20) {
     const entries = [...this.analysisStore.values()];
     return entries.slice(-limit);
   }
 
+  /**
+   * Build a comprehensive platform status snapshot. Aggregates state from
+   * every subsystem: pipeline health, circuit breaker, fabric throughput,
+   * classifier performance, identity resolution, journey intelligence,
+   * NBA statistics, and the full metrics dashboard.
+   *
+   * Used by the GET /api/status endpoint.
+   *
+   * @returns {Object} Full platform status
+   */
   getStatus() {
     const { getCircuitState } = require('./classifier/llm-client');
     return {
@@ -338,6 +449,14 @@ class Pipeline {
   }
 }
 
+/**
+ * Module-level singleton accessor for the Pipeline.
+ * Creates and starts a new instance on first call; returns the same instance thereafter.
+ * The start() call is awaited, so the classifier embedding index is fully built
+ * before the pipeline begins accepting events.
+ *
+ * @returns {Promise<Pipeline>} The singleton pipeline instance
+ */
 let instance = null;
 async function getPipeline() {
   if (!instance) {
