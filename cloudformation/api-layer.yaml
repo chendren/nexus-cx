@@ -1,0 +1,1231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — API Layer
+  REST API for dashboard consumption with Cognito authentication.
+  Endpoints for metrics, customer profiles, journeys, NBA actions,
+  and taxonomy-based classification. Includes usage plans and API keys.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+
+  # DynamoDB table references
+  CustomerProfilesTableName:
+    Type: String
+  CustomerProfilesTableArn:
+    Type: String
+  JourneysTableName:
+    Type: String
+  JourneysTableArn:
+    Type: String
+  NBAActionsTableName:
+    Type: String
+  NBAActionsTableArn:
+    Type: String
+  InteractionsTableName:
+    Type: String
+  InteractionsTableArn:
+    Type: String
+  TaxonomyTableName:
+    Type: String
+  TaxonomyTableArn:
+    Type: String
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ==========================================================================
+  #  Cognito User Pool — API authentication
+  # ==========================================================================
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Environment}-api-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-${Environment}-dashboard-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ==========================================================================
+  #  REST API Gateway
+  # ==========================================================================
+
+  DashboardApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-api'
+      Description: REST API for CX Intelligence Platform dashboard and data access
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref DashboardApi
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+  # ==========================================================================
+  #  Shared Lambda Execution Role for API handlers
+  # ==========================================================================
+
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-api-handler'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref CustomerProfilesTableArn
+                  - !Sub '${CustomerProfilesTableArn}/index/*'
+                  - !Ref JourneysTableArn
+                  - !Sub '${JourneysTableArn}/index/*'
+                  - !Ref NBAActionsTableArn
+                  - !Sub '${NBAActionsTableArn}/index/*'
+                  - !Ref InteractionsTableArn
+                  - !Sub '${InteractionsTableArn}/index/*'
+                  - !Ref TaxonomyTableArn
+                  - !Sub '${TaxonomyTableArn}/index/*'
+        - PolicyName: CloudWatchReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+
+  # ==========================================================================
+  #  GET /dashboard — aggregated metrics
+  # ==========================================================================
+
+  DashboardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api-dashboard'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  DashboardFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DashboardLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api-dashboard'
+      Description: Returns aggregated platform metrics for the dashboard
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTableName
+          JOURNEYS_TABLE: !Ref JourneysTableName
+          NBA_ACTIONS_TABLE: !Ref NBAActionsTableName
+          INTERACTIONS_TABLE: !Ref InteractionsTableName
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          """
+          Dashboard Metrics API
+          Returns aggregated metrics: event throughput, classification distribution,
+          journey completion rates, NBA action effectiveness.
+          """
+          import json
+          import os
+          import time
+          from datetime import datetime, timedelta
+          import boto3
+          from boto3.dynamodb.conditions import Key, Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          PROFILES_TABLE = os.environ['CUSTOMER_PROFILES_TABLE']
+          JOURNEYS_TABLE = os.environ['JOURNEYS_TABLE']
+          NBA_TABLE = os.environ['NBA_ACTIONS_TABLE']
+          PROJECT = os.environ['PROJECT_NAME']
+          ENV = os.environ['ENVIRONMENT']
+
+          journeys_table = dynamodb.Table(JOURNEYS_TABLE)
+          profiles_table = dynamodb.Table(PROFILES_TABLE)
+          nba_table = dynamodb.Table(NBA_TABLE)
+
+          CORS_HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+          }
+
+          def get_kinesis_metrics(stream_name, period_minutes=60):
+              """Get Kinesis throughput metrics from CloudWatch."""
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(minutes=period_minutes)
+              response = cloudwatch.get_metric_statistics(
+                  Namespace='AWS/Kinesis',
+                  MetricName='IncomingRecords',
+                  Dimensions=[{'Name': 'StreamName', 'Value': stream_name}],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=60,
+                  Statistics=['Sum']
+              )
+              datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+              return [{'timestamp': dp['Timestamp'].isoformat(), 'count': dp['Sum']} for dp in datapoints]
+
+          def get_journey_stats():
+              """Get journey completion and status statistics."""
+              stats = {'active': 0, 'completed': 0, 'by_type': {}}
+              for status in ['active', 'completed']:
+                  response = journeys_table.query(
+                      IndexName='by-status',
+                      KeyConditionExpression=Key('status').eq(status),
+                      Select='COUNT'
+                  )
+                  stats[status] = response.get('Count', 0)
+              return stats
+
+          def get_table_count(table):
+              """Get approximate item count for a DynamoDB table."""
+              response = table.scan(Select='COUNT')
+              return response.get('Count', 0)
+
+          def handler(event, context):
+              try:
+                  raw_stream = f'{PROJECT}-{ENV}-raw-events'
+                  classified_stream = f'{PROJECT}-{ENV}-classified-events'
+
+                  metrics = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'environment': ENV,
+                      'event_throughput': {
+                          'raw_events': get_kinesis_metrics(raw_stream),
+                          'classified_events': get_kinesis_metrics(classified_stream)
+                      },
+                      'journey_stats': get_journey_stats(),
+                      'counts': {
+                          'total_profiles': get_table_count(profiles_table),
+                          'total_nba_actions': get_table_count(nba_table)
+                      }
+                  }
+
+                  return {
+                      'statusCode': 200,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps(metrics, default=str)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DashboardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !GetAtt DashboardApi.RootResourceId
+      PathPart: dashboard
+
+  DashboardGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref DashboardResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardFunction.Arn}/invocations'
+
+  DashboardOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref DashboardResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DashboardFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/*'
+
+  # ==========================================================================
+  #  GET /customers/{id} — customer profile with journeys
+  # ==========================================================================
+
+  CustomerProfileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api-customer-profile'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  CustomerProfileFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CustomerProfileLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api-customer-profile'
+      Description: Returns customer profile with active journeys and recent interactions
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTableName
+          JOURNEYS_TABLE: !Ref JourneysTableName
+          INTERACTIONS_TABLE: !Ref InteractionsTableName
+          NBA_ACTIONS_TABLE: !Ref NBAActionsTableName
+      Code:
+        ZipFile: |
+          """
+          Customer Profile API
+          Returns a customer profile enriched with active journeys,
+          recent interactions, and pending NBA actions.
+          """
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+
+          profiles_table = dynamodb.Table(os.environ['CUSTOMER_PROFILES_TABLE'])
+          journeys_table = dynamodb.Table(os.environ['JOURNEYS_TABLE'])
+          interactions_table = dynamodb.Table(os.environ['INTERACTIONS_TABLE'])
+          nba_table = dynamodb.Table(os.environ['NBA_ACTIONS_TABLE'])
+
+          CORS_HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+          }
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj) if obj % 1 else int(obj)
+                  if isinstance(obj, set):
+                      return list(obj)
+                  return super().default(obj)
+
+          def handler(event, context):
+              customer_id = event.get('pathParameters', {}).get('id')
+              if not customer_id:
+                  return {
+                      'statusCode': 400,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({'error': 'Customer ID is required'})
+                  }
+
+              try:
+                  # Fetch profile
+                  profile_resp = profiles_table.get_item(Key={'customer_id': customer_id})
+                  profile = profile_resp.get('Item')
+                  if not profile:
+                      return {
+                          'statusCode': 404,
+                          'headers': CORS_HEADERS,
+                          'body': json.dumps({'error': 'Customer not found'})
+                      }
+
+                  # Fetch active journeys
+                  journeys_resp = journeys_table.query(
+                      KeyConditionExpression=Key('customer_id').eq(customer_id),
+                      Limit=20
+                  )
+
+                  # Fetch recent interactions (last 50)
+                  interactions_resp = interactions_table.query(
+                      KeyConditionExpression=Key('customer_id').eq(customer_id),
+                      ScanIndexForward=False,
+                      Limit=50
+                  )
+
+                  # Fetch pending NBA actions
+                  nba_resp = nba_table.query(
+                      KeyConditionExpression=Key('customer_id').eq(customer_id),
+                      ScanIndexForward=False,
+                      Limit=10
+                  )
+
+                  result = {
+                      'profile': profile,
+                      'journeys': journeys_resp.get('Items', []),
+                      'recent_interactions': interactions_resp.get('Items', []),
+                      'pending_actions': nba_resp.get('Items', [])
+                  }
+
+                  return {
+                      'statusCode': 200,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps(result, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CustomersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !GetAtt DashboardApi.RootResourceId
+      PathPart: customers
+
+  CustomerIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !Ref CustomersResource
+      PathPart: '{id}'
+
+  CustomerGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref CustomerIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomerProfileFunction.Arn}/invocations'
+
+  CustomerOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref CustomerIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  CustomerProfileFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CustomerProfileFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/*'
+
+  # ==========================================================================
+  #  GET /journeys — journey statistics
+  # ==========================================================================
+
+  JourneyStatsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api-journey-stats'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  JourneyStatsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: JourneyStatsLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api-journey-stats'
+      Description: Returns journey statistics — counts by type, state, and status
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment:
+        Variables:
+          JOURNEYS_TABLE: !Ref JourneysTableName
+      Code:
+        ZipFile: |
+          """
+          Journey Statistics API
+          Returns aggregate journey metrics: counts by type, state distribution,
+          completion rates, and average journey duration.
+          """
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          journeys_table = dynamodb.Table(os.environ['JOURNEYS_TABLE'])
+
+          CORS_HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+          }
+
+          JOURNEY_TYPES = ['purchase', 'support', 'onboarding']
+          STATUSES = ['active', 'completed']
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj) if obj % 1 else int(obj)
+                  return super().default(obj)
+
+          def handler(event, context):
+              try:
+                  # Query params for filtering
+                  params = event.get('queryStringParameters') or {}
+                  journey_type = params.get('type')
+                  status = params.get('status')
+
+                  stats = {
+                      'by_status': {},
+                      'by_type': {}
+                  }
+
+                  # Count by status
+                  for s in STATUSES:
+                      if status and s != status:
+                          continue
+                      resp = journeys_table.query(
+                          IndexName='by-status',
+                          KeyConditionExpression=Key('status').eq(s),
+                          Select='COUNT'
+                      )
+                      stats['by_status'][s] = resp.get('Count', 0)
+
+                  # Count by type and state
+                  for jt in JOURNEY_TYPES:
+                      if journey_type and jt != journey_type:
+                          continue
+                      resp = journeys_table.query(
+                          IndexName='by-type-state',
+                          KeyConditionExpression=Key('journey_type').eq(jt),
+                          Select='COUNT'
+                      )
+                      stats['by_type'][jt] = {'total': resp.get('Count', 0)}
+
+                  stats['total_journeys'] = sum(v for v in stats['by_status'].values())
+
+                  return {
+                      'statusCode': 200,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps(stats, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  JourneysResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !GetAtt DashboardApi.RootResourceId
+      PathPart: journeys
+
+  JourneysGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref JourneysResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JourneyStatsFunction.Arn}/invocations'
+
+  JourneysOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref JourneysResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  JourneyStatsFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref JourneyStatsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/*'
+
+  # ==========================================================================
+  #  GET /nba/actions — recent NBA actions
+  # ==========================================================================
+
+  NBAActionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api-nba-actions'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  NBAActionsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NBAActionsLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api-nba-actions'
+      Description: Returns recent NBA actions with filtering by urgency and status
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment:
+        Variables:
+          NBA_ACTIONS_TABLE: !Ref NBAActionsTableName
+      Code:
+        ZipFile: |
+          """
+          NBA Actions API
+          Returns recent next-best-action recommendations with filtering
+          by urgency, status, and customer_id.
+          """
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key, Attr
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          nba_table = dynamodb.Table(os.environ['NBA_ACTIONS_TABLE'])
+
+          CORS_HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+          }
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj) if obj % 1 else int(obj)
+                  if isinstance(obj, set):
+                      return list(obj)
+                  return super().default(obj)
+
+          def handler(event, context):
+              try:
+                  params = event.get('queryStringParameters') or {}
+                  customer_id = params.get('customer_id')
+                  limit = min(int(params.get('limit', '50')), 200)
+
+                  if customer_id:
+                      # Query actions for a specific customer
+                      resp = nba_table.query(
+                          KeyConditionExpression=Key('customer_id').eq(customer_id),
+                          ScanIndexForward=False,
+                          Limit=limit
+                      )
+                      actions = resp.get('Items', [])
+                  else:
+                      # Scan recent actions (with optional urgency filter)
+                      scan_params = {'Limit': limit}
+                      urgency = params.get('urgency')
+                      if urgency:
+                          scan_params['FilterExpression'] = Attr('urgency').eq(urgency)
+                      resp = nba_table.scan(**scan_params)
+                      actions = resp.get('Items', [])
+
+                  return {
+                      'statusCode': 200,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({
+                          'actions': actions,
+                          'count': len(actions)
+                      }, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NBAResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !GetAtt DashboardApi.RootResourceId
+      PathPart: nba
+
+  NBAActionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !Ref NBAResource
+      PathPart: actions
+
+  NBAActionsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref NBAActionsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NBAActionsFunction.Arn}/invocations'
+
+  NBAActionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref NBAActionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  NBAActionsFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NBAActionsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/*'
+
+  # ==========================================================================
+  #  POST /classify — classify text against taxonomy
+  # ==========================================================================
+
+  ClassifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api-classify'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  ClassifyFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ClassifyLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api-classify'
+      Description: Classifies input text against the frozen taxonomy
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment:
+        Variables:
+          TAXONOMY_TABLE: !Ref TaxonomyTableName
+      Code:
+        ZipFile: |
+          """
+          Classification API
+          Accepts text input and classifies it against the frozen taxonomy.
+          Returns domain, intent, confidence, and matching taxonomy entry.
+          """
+          import json
+          import os
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          taxonomy_table = dynamodb.Table(os.environ['TAXONOMY_TABLE'])
+
+          CORS_HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+          }
+
+          # Keyword-based classification mapping
+          KEYWORD_MAP = {
+              'commerce': {
+                  'keywords': ['buy', 'purchase', 'order', 'cart', 'checkout', 'price', 'product', 'shipping'],
+                  'intents': {
+                      'purchase_inquiry': ['buy', 'purchase', 'order'],
+                      'pricing': ['price', 'cost', 'discount', 'coupon'],
+                      'shipping': ['shipping', 'delivery', 'track'],
+                      'returns': ['return', 'refund', 'exchange']
+                  }
+              },
+              'support': {
+                  'keywords': ['help', 'issue', 'problem', 'broken', 'error', 'complaint', 'support', 'ticket'],
+                  'intents': {
+                      'technical_issue': ['error', 'broken', 'bug', 'crash'],
+                      'complaint': ['complaint', 'unhappy', 'disappointed', 'terrible'],
+                      'general_inquiry': ['help', 'question', 'how to']
+                  }
+              },
+              'feedback': {
+                  'keywords': ['feedback', 'review', 'rating', 'survey', 'nps', 'satisfaction'],
+                  'intents': {
+                      'positive_feedback': ['great', 'excellent', 'love', 'amazing'],
+                      'negative_feedback': ['poor', 'bad', 'worst', 'hate'],
+                      'survey_response': ['survey', 'nps', 'rating']
+                  }
+              },
+              'engagement': {
+                  'keywords': ['browse', 'view', 'click', 'visit', 'explore', 'search'],
+                  'intents': {
+                      'browsing': ['browse', 'view', 'visit'],
+                      'search': ['search', 'find', 'looking for'],
+                      'content_engagement': ['click', 'read', 'watch']
+                  }
+              }
+          }
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj) if obj % 1 else int(obj)
+                  return super().default(obj)
+
+          def classify_text(text):
+              """Classify text using keyword matching against taxonomy."""
+              text_lower = text.lower()
+              best_match = {'domain': 'unknown', 'intent': 'unclassified', 'confidence': 0.0}
+
+              for domain, config in KEYWORD_MAP.items():
+                  # Check domain-level keywords
+                  domain_hits = sum(1 for kw in config['keywords'] if kw in text_lower)
+                  if domain_hits == 0:
+                      continue
+
+                  domain_confidence = min(domain_hits / len(config['keywords']) * 2, 1.0)
+
+                  # Check intent-level keywords
+                  best_intent = None
+                  best_intent_confidence = 0.0
+                  for intent, keywords in config['intents'].items():
+                      intent_hits = sum(1 for kw in keywords if kw in text_lower)
+                      if intent_hits > 0:
+                          intent_confidence = min(intent_hits / len(keywords), 1.0)
+                          if intent_confidence > best_intent_confidence:
+                              best_intent = intent
+                              best_intent_confidence = intent_confidence
+
+                  combined_confidence = (domain_confidence + best_intent_confidence) / 2
+                  if combined_confidence > best_match['confidence']:
+                      best_match = {
+                          'domain': domain,
+                          'intent': best_intent or 'general',
+                          'confidence': round(combined_confidence, 3),
+                          'domain_confidence': round(domain_confidence, 3),
+                          'intent_confidence': round(best_intent_confidence, 3)
+                      }
+
+              return best_match
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  text = body.get('text', '')
+
+                  if not text:
+                      return {
+                          'statusCode': 400,
+                          'headers': CORS_HEADERS,
+                          'body': json.dumps({'error': 'text field is required'})
+                      }
+
+                  classification = classify_text(text)
+
+                  # Look up taxonomy entry if we got a match
+                  taxonomy_entry = None
+                  if classification['domain'] != 'unknown':
+                      try:
+                          resp = taxonomy_table.get_item(Key={
+                              'domain': classification['domain'],
+                              'intent': classification['intent']
+                          })
+                          taxonomy_entry = resp.get('Item')
+                      except Exception:
+                          pass
+
+                  result = {
+                      'input_text': text,
+                      'classification': classification,
+                      'taxonomy_entry': taxonomy_entry,
+                      'method': 'keyword_deterministic'
+                  }
+
+                  return {
+                      'statusCode': 200,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps(result, cls=DecimalEncoder)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': CORS_HEADERS,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ClassifyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ParentId: !GetAtt DashboardApi.RootResourceId
+      PathPart: classify
+
+  ClassifyPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref ClassifyResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClassifyFunction.Arn}/invocations'
+
+  ClassifyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DashboardApi
+      ResourceId: !Ref ClassifyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ClassifyFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ClassifyFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DashboardApi}/*'
+
+  # ==========================================================================
+  #  API Deployment & Stage
+  # ==========================================================================
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DashboardGetMethod
+      - DashboardOptionsMethod
+      - CustomerGetMethod
+      - CustomerOptionsMethod
+      - JourneysGetMethod
+      - JourneysOptionsMethod
+      - NBAActionsGetMethod
+      - NBAActionsOptionsMethod
+      - ClassifyPostMethod
+      - ClassifyOptionsMethod
+    Properties:
+      RestApiId: !Ref DashboardApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DashboardApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage for dashboard API'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: !If [IsProd, 1000, 100]
+          ThrottlingRateLimit: !If [IsProd, 2000, 200]
+          MetricsEnabled: true
+          DataTraceEnabled: !If [IsProd, false, true]
+          LoggingLevel: !If [IsProd, ERROR, INFO]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  API Usage Plan & API Key
+  # ==========================================================================
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-${Environment}-usage-plan'
+      Description: Usage plan for the CX Intelligence dashboard API
+      ApiStages:
+        - ApiId: !Ref DashboardApi
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: !If [IsProd, 1000, 100]
+        RateLimit: !If [IsProd, 2000, 200]
+      Quota:
+        Limit: !If [IsProd, 1000000, 100000]
+        Period: MONTH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-key'
+      Description: API key for programmatic access to the dashboard API
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref DashboardApi
+          StageName: !Ref Environment
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiKeyUsagePlanAssociation:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  DashboardApiUrl:
+    Description: Dashboard REST API URL
+    Value: !Sub 'https://${DashboardApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+  DashboardApiId:
+    Description: Dashboard REST API ID
+    Value: !Ref DashboardApi
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID for API authentication
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt CognitoUserPool.Arn
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+
+  ApiKeyId:
+    Description: API Key ID for programmatic access
+    Value: !Ref ApiKey

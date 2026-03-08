@@ -1,0 +1,847 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — Orchestration Layer
+  EventBridge custom bus with rules for journey state changes, high-urgency
+  actions, cross-channel identity stitching, and complaint escalation.
+  Step Functions for journey orchestration and escalation workflows.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+
+  NBAEvaluatorFunctionArn:
+    Type: String
+    Description: ARN of the NBA Evaluator Lambda function
+
+  IdentityResolverFunctionArn:
+    Type: String
+    Description: ARN of the Identity Resolver Lambda function
+
+  CustomerProfilesTableName:
+    Type: String
+  CustomerProfilesTableArn:
+    Type: String
+  JourneysTableName:
+    Type: String
+  JourneysTableArn:
+    Type: String
+  NBAActionsTableName:
+    Type: String
+  NBAActionsTableArn:
+    Type: String
+
+  NotificationEmail:
+    Type: String
+    MinLength: 5
+    MaxLength: 128
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ==========================================================================
+  #  EventBridge Custom Event Bus
+  # ==========================================================================
+
+  CXIntelligenceBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-cx-intelligence'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  SNS Topic — high-urgency action notifications
+  # ==========================================================================
+
+  UrgentActionsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-urgent-actions'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  UrgentActionsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UrgentActionsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ==========================================================================
+  #  EventBridge Rules
+  # ==========================================================================
+
+  # Rule 1: Journey state changes -> trigger NBA re-evaluation
+  JourneyStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-journey-state-change'
+      Description: Triggers NBA evaluation when a customer journey changes state
+      EventBusName: !Ref CXIntelligenceBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - cx-intelligence.journey
+        detail-type:
+          - JourneyStateChange
+      Targets:
+        - Id: NBAEvaluator
+          Arn: !Ref NBAEvaluatorFunctionArn
+
+  # Permission for EventBridge to invoke NBA Evaluator
+  NBAEvaluatorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NBAEvaluatorFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt JourneyStateChangeRule.Arn
+
+  # Rule 2: High-urgency NBA actions -> SNS notification
+  HighUrgencyActionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-high-urgency-action'
+      Description: Sends SNS notification for critical and high-urgency NBA actions
+      EventBusName: !Ref CXIntelligenceBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - cx-intelligence.nba
+        detail-type:
+          - NBAAction.critical
+          - NBAAction.high
+      Targets:
+        - Id: UrgentNotification
+          Arn: !Ref UrgentActionsTopic
+          InputTransformer:
+            InputPathsMap:
+              customer: $.detail.customer_id
+              action: $.detail.action_type
+              urgency: $.detail.urgency
+              channel: $.detail.delivery_channel
+            InputTemplate: |
+              "URGENT CX Action Required: <action> for customer <customer> via <channel> (urgency: <urgency>)"
+
+  # SNS policy to allow EventBridge to publish
+  UrgentActionsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref UrgentActionsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref UrgentActionsTopic
+
+  # Rule 3: Cross-channel events -> trigger identity stitching
+  CrossChannelRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-cross-channel-stitch'
+      Description: Triggers identity stitching when a customer interacts across channels
+      EventBusName: !Ref CXIntelligenceBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - cx-intelligence.identity
+        detail-type:
+          - CrossChannelInteraction
+      Targets:
+        - Id: IdentityStitcher
+          Arn: !Ref IdentityResolverFunctionArn
+
+  # Permission for EventBridge to invoke Identity Resolver
+  IdentityResolverEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdentityResolverFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CrossChannelRule.Arn
+
+  # Rule 4: Complaint detection -> trigger escalation workflow
+  ComplaintEscalationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-complaint-escalation'
+      Description: Triggers escalation workflow when a complaint is detected
+      EventBusName: !Ref CXIntelligenceBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - cx-intelligence.classification
+        detail-type:
+          - ComplaintDetected
+          - EscalationRequired
+      Targets:
+        - Id: EscalationWorkflow
+          Arn: !Ref EscalationWorkflow
+          RoleArn: !GetAtt EventBridgeStepFunctionsRole.Arn
+
+  # ==========================================================================
+  #  IAM Roles for EventBridge -> Step Functions
+  # ==========================================================================
+
+  EventBridgeStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-eb-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStepFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref JourneyOrchestrator
+                  - !Ref EscalationWorkflow
+
+  # ==========================================================================
+  #  Step Functions Execution Role
+  # ==========================================================================
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-sfn-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Ref NBAEvaluatorFunctionArn
+                  - !Ref IdentityResolverFunctionArn
+                  - !GetAtt EscalationNotifierFunction.Arn
+                  - !GetAtt JourneyEvaluatorFunction.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref CustomerProfilesTableArn
+                  - !Ref JourneysTableArn
+                  - !Ref NBAActionsTableArn
+                  - !Sub '${JourneysTableArn}/index/*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref UrgentActionsTopic
+        - PolicyName: EventBridgePut
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt CXIntelligenceBus.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  # ==========================================================================
+  #  Helper Lambda — Escalation Notifier
+  # ==========================================================================
+
+  EscalationNotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-escalation-notifier'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  EscalationNotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-escalation-notifier'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref UrgentActionsTopic
+        - PolicyName: DynamoDBRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref CustomerProfilesTableArn
+                  - !Sub '${CustomerProfilesTableArn}/index/*'
+
+  EscalationNotifierFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: EscalationNotifierLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-escalation-notifier'
+      Description: Sends notifications for escalated complaints
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt EscalationNotifierRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref UrgentActionsTopic
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTableName
+      Code:
+        ZipFile: |
+          """
+          Escalation Notifier
+          Sends formatted notifications for escalated customer complaints.
+          """
+          import json
+          import os
+          import boto3
+
+          sns = boto3.client('sns')
+          dynamodb = boto3.resource('dynamodb')
+          TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          PROFILES_TABLE = os.environ['CUSTOMER_PROFILES_TABLE']
+          profiles_table = dynamodb.Table(PROFILES_TABLE)
+
+          def handler(event, context):
+              customer_id = event.get('customer_id', 'unknown')
+              complaint_type = event.get('complaint_type', 'general')
+              severity = event.get('severity', 'medium')
+              channel = event.get('channel', 'unknown')
+
+              # Look up customer profile for context
+              profile = {}
+              try:
+                  resp = profiles_table.get_item(Key={'customer_id': customer_id})
+                  profile = resp.get('Item', {})
+              except Exception:
+                  pass
+
+              message = {
+                  'subject': f'ESCALATION: {complaint_type} complaint from {customer_id}',
+                  'body': json.dumps({
+                      'customer_id': customer_id,
+                      'complaint_type': complaint_type,
+                      'severity': severity,
+                      'channel': channel,
+                      'customer_email': profile.get('email', 'N/A'),
+                      'total_interactions': profile.get('total_interactions', 0),
+                      'action_required': 'Immediate attention required'
+                  }, indent=2)
+              }
+
+              sns.publish(
+                  TopicArn=TOPIC_ARN,
+                  Subject=message['subject'][:100],
+                  Message=message['body']
+              )
+
+              return {
+                  'statusCode': 200,
+                  'notified': True,
+                  'customer_id': customer_id
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  Helper Lambda — Journey Evaluator (for Step Functions)
+  # ==========================================================================
+
+  JourneyEvaluatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-journey-evaluator'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  JourneyEvaluatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-journey-evaluator'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Ref JourneysTableArn
+                  - !Sub '${JourneysTableArn}/index/*'
+                  - !Ref CustomerProfilesTableArn
+
+  JourneyEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: JourneyEvaluatorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-journey-evaluator'
+      Description: Evaluates journey status for Step Functions orchestration
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt JourneyEvaluatorRole.Arn
+      Environment:
+        Variables:
+          JOURNEYS_TABLE: !Ref JourneysTableName
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTableName
+      Code:
+        ZipFile: |
+          """
+          Journey Evaluator
+          Evaluates journey completion status, checks for stalled journeys,
+          and determines if intervention is needed.
+          """
+          import json
+          import os
+          import time
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          JOURNEYS_TABLE = os.environ['JOURNEYS_TABLE']
+          journeys_table = dynamodb.Table(JOURNEYS_TABLE)
+
+          STALL_THRESHOLDS = {
+              'purchase': 3600,     # 1 hour
+              'support': 7200,      # 2 hours
+              'onboarding': 86400   # 24 hours
+          }
+
+          def handler(event, context):
+              customer_id = event.get('customer_id')
+              journey_type = event.get('journey_type')
+              action = event.get('action', 'evaluate')
+
+              if action == 'check_stalled':
+                  # Check if journey is stalled
+                  journey_key = f'{journey_type}#active'
+                  resp = journeys_table.get_item(
+                      Key={'customer_id': customer_id, 'journey_key': journey_key}
+                  )
+                  journey = resp.get('Item')
+                  if not journey:
+                      return {'stalled': False, 'reason': 'no_active_journey'}
+
+                  now = int(time.time() * 1000)
+                  updated = journey.get('updated_at', now)
+                  threshold_ms = STALL_THRESHOLDS.get(journey_type, 3600) * 1000
+
+                  is_stalled = (now - updated) > threshold_ms
+                  return {
+                      'stalled': is_stalled,
+                      'current_state': journey.get('current_state'),
+                      'seconds_since_update': int((now - updated) / 1000),
+                      'customer_id': customer_id,
+                      'journey_type': journey_type
+                  }
+
+              elif action == 'complete':
+                  # Mark journey as completed
+                  journey_key = f'{journey_type}#active'
+                  journeys_table.update_item(
+                      Key={'customer_id': customer_id, 'journey_key': journey_key},
+                      UpdateExpression='SET #s = :completed, updated_at = :now',
+                      ExpressionAttributeNames={'#s': 'status'},
+                      ExpressionAttributeValues={
+                          ':completed': 'completed',
+                          ':now': int(time.time() * 1000)
+                      }
+                  )
+                  return {'completed': True, 'customer_id': customer_id}
+
+              return {'evaluated': True, 'customer_id': customer_id}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  Step Function: Journey Orchestrator
+  # ==========================================================================
+
+  JourneyOrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-${Environment}-journey-orchestrator'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  JourneyOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-journey-orchestrator'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: !If [IsProd, ERROR, ALL]
+        IncludeExecutionData: !If [IsProd, false, true]
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt JourneyOrchestratorLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Journey Orchestrator — manages complex multi-step customer journeys with stall detection, NBA evaluation, and completion tracking.",
+          "StartAt": "EvaluateJourney",
+          "States": {
+            "EvaluateJourney": {
+              "Type": "Task",
+              "Resource": "${JourneyEvaluatorFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.customer_id",
+                "journey_type.$": "$.journey_type",
+                "action": "evaluate"
+              },
+              "ResultPath": "$.evaluation",
+              "Next": "CheckJourneyStatus"
+            },
+            "CheckJourneyStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.evaluation.stalled",
+                  "BooleanEquals": true,
+                  "Next": "HandleStalledJourney"
+                }
+              ],
+              "Default": "WaitForNextCheck"
+            },
+            "HandleStalledJourney": {
+              "Type": "Task",
+              "Resource": "${NBAEvaluatorFunctionArn}",
+              "Parameters": {
+                "customer_id.$": "$.customer_id",
+                "journey_type.$": "$.journey_type",
+                "trigger": "stalled_journey",
+                "current_state.$": "$.evaluation.current_state"
+              },
+              "ResultPath": "$.nba_result",
+              "Next": "WaitForNextCheck"
+            },
+            "WaitForNextCheck": {
+              "Type": "Wait",
+              "Seconds": 3600,
+              "Next": "ReEvaluateJourney"
+            },
+            "ReEvaluateJourney": {
+              "Type": "Task",
+              "Resource": "${JourneyEvaluatorFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.customer_id",
+                "journey_type.$": "$.journey_type",
+                "action": "check_stalled"
+              },
+              "ResultPath": "$.evaluation",
+              "Next": "IsJourneyComplete"
+            },
+            "IsJourneyComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.evaluation.current_state",
+                  "StringEquals": "completed",
+                  "Next": "MarkCompleted"
+                },
+                {
+                  "Variable": "$.evaluation.stalled",
+                  "BooleanEquals": true,
+                  "Next": "HandleStalledJourney"
+                }
+              ],
+              "Default": "WaitForNextCheck"
+            },
+            "MarkCompleted": {
+              "Type": "Task",
+              "Resource": "${JourneyEvaluatorFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.customer_id",
+                "journey_type.$": "$.journey_type",
+                "action": "complete"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  Step Function: Escalation Workflow
+  # ==========================================================================
+
+  EscalationWorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-${Environment}-escalation-workflow'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  EscalationWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-escalation-workflow'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: !If [IsProd, ERROR, ALL]
+        IncludeExecutionData: !If [IsProd, false, true]
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt EscalationWorkflowLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Escalation Workflow — handles complaint escalation with severity assessment, notification, and resolution tracking.",
+          "StartAt": "AssessSeverity",
+          "States": {
+            "AssessSeverity": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.detail.severity",
+                  "StringEquals": "critical",
+                  "Next": "ImmediateNotification"
+                },
+                {
+                  "Variable": "$.detail.severity",
+                  "StringEquals": "high",
+                  "Next": "UrgentNotification"
+                }
+              ],
+              "Default": "StandardNotification"
+            },
+            "ImmediateNotification": {
+              "Type": "Task",
+              "Resource": "${EscalationNotifierFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.detail.customer_id",
+                "complaint_type.$": "$.detail.complaint_type",
+                "severity": "critical",
+                "channel.$": "$.detail.channel"
+              },
+              "ResultPath": "$.notification_result",
+              "Next": "CreatePriorityAction"
+            },
+            "UrgentNotification": {
+              "Type": "Task",
+              "Resource": "${EscalationNotifierFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.detail.customer_id",
+                "complaint_type.$": "$.detail.complaint_type",
+                "severity": "high",
+                "channel.$": "$.detail.channel"
+              },
+              "ResultPath": "$.notification_result",
+              "Next": "CreatePriorityAction"
+            },
+            "StandardNotification": {
+              "Type": "Task",
+              "Resource": "${EscalationNotifierFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.detail.customer_id",
+                "complaint_type.$": "$.detail.complaint_type",
+                "severity": "medium",
+                "channel.$": "$.detail.channel"
+              },
+              "ResultPath": "$.notification_result",
+              "Next": "WaitForResolution"
+            },
+            "CreatePriorityAction": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${NBAActionsTableName}",
+                "Item": {
+                  "customer_id": {"S.$": "$.detail.customer_id"},
+                  "timestamp_action_id": {"S.$": "States.Format('{}#escalation', $.detail.timestamp)"},
+                  "action_type": {"S": "priority_escalation"},
+                  "urgency": {"S.$": "$.detail.severity"},
+                  "status": {"S": "pending_resolution"},
+                  "delivery_channel": {"S": "voice"}
+                }
+              },
+              "ResultPath": "$.action_result",
+              "Next": "WaitForResolution"
+            },
+            "WaitForResolution": {
+              "Type": "Wait",
+              "Seconds": 1800,
+              "Next": "CheckResolution"
+            },
+            "CheckResolution": {
+              "Type": "Task",
+              "Resource": "${JourneyEvaluatorFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.detail.customer_id",
+                "journey_type": "support",
+                "action": "check_stalled"
+              },
+              "ResultPath": "$.resolution_check",
+              "Next": "IsResolved"
+            },
+            "IsResolved": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.resolution_check.current_state",
+                  "StringEquals": "resolved",
+                  "Next": "EscalationResolved"
+                },
+                {
+                  "Variable": "$.resolution_check.seconds_since_update",
+                  "NumericGreaterThan": 7200,
+                  "Next": "ReEscalate"
+                }
+              ],
+              "Default": "WaitForResolution"
+            },
+            "ReEscalate": {
+              "Type": "Task",
+              "Resource": "${EscalationNotifierFunction.Arn}",
+              "Parameters": {
+                "customer_id.$": "$.detail.customer_id",
+                "complaint_type": "unresolved_escalation",
+                "severity": "critical",
+                "channel.$": "$.detail.channel"
+              },
+              "ResultPath": "$.reescalation_result",
+              "Next": "WaitForResolution"
+            },
+            "EscalationResolved": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  CXIntelligenceBusArn:
+    Description: ARN of the CX Intelligence EventBridge bus
+    Value: !GetAtt CXIntelligenceBus.Arn
+  CXIntelligenceBusName:
+    Description: Name of the CX Intelligence EventBridge bus
+    Value: !Ref CXIntelligenceBus
+
+  JourneyOrchestratorArn:
+    Description: ARN of the Journey Orchestrator state machine
+    Value: !Ref JourneyOrchestrator
+
+  EscalationWorkflowArn:
+    Description: ARN of the Escalation Workflow state machine
+    Value: !Ref EscalationWorkflow
+
+  UrgentActionsTopicArn:
+    Description: ARN of the urgent actions SNS topic
+    Value: !Ref UrgentActionsTopic

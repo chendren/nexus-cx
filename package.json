@@ -1,0 +1,25 @@
+{
+  "name": "nexus-cx",
+  "version": "1.0.0",
+  "description": "Nexus CX - Real-time omnichannel customer experience intelligence platform with semantic classification, journey tracking, next-best-action orchestration, and live operational dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --dev",
+    "test": "node tests/integration.test.js",
+    "bench": "node tests/benchmark.js --report",
+    "simulate": "node tests/simulate-traffic.js",
+    "simulate:heavy": "node tests/simulate-traffic.js --count 200 --concurrency 10 --report",
+    "health": "curl -s http://localhost:3143/api/health/ready | node -e \"process.stdin.on('data',d=>{const h=JSON.parse(d);console.log(h.status,'-',JSON.stringify(h.checks))})\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^8.3.0",
+    "helmet": "^8.1.0",
+    "pino": "^10.3.1",
+    "uuid": "^10.0.0",
+    "ws": "^8.18.0"
+  }
+}

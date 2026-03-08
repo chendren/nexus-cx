@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — Data Stores Layer
+  DynamoDB tables for customer profiles, journeys, interactions,
+  taxonomy definitions, and NBA actions. All tables use on-demand
+  capacity with encryption at rest.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  EnablePITR: !Or
+    - !Equals [!Ref Environment, prod]
+    - !Equals [!Ref Environment, staging]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ==========================================================================
+  #  Customer Profiles Table
+  #  PK: customer_id
+  #  GSI: by-email (email -> customer_id)
+  #  GSI: by-phone (phone -> customer_id)
+  # ==========================================================================
+
+  CustomerProfilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-customer-profiles'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      # Primary key: customer_id
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: phone
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # GSI: Look up customer by email
+        - IndexName: by-email
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        # GSI: Look up customer by phone
+        - IndexName: by-phone
+          KeySchema:
+            - AttributeName: phone
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Table
+          Value: customer-profiles
+
+  # ==========================================================================
+  #  Journeys Table
+  #  PK: customer_id, SK: journey_key (e.g., "purchase#active")
+  #  GSI: by-type-state (journey_type, current_state)
+  #  GSI: by-status (status, updated_at)
+  # ==========================================================================
+
+  JourneysTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-journeys'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: journey_key
+          AttributeType: S
+        - AttributeName: journey_type
+          AttributeType: S
+        - AttributeName: current_state
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: updated_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+        - AttributeName: journey_key
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI: Query journeys by type and current state
+        # Use case: "Show all purchase journeys in 'abandoned' state"
+        - IndexName: by-type-state
+          KeySchema:
+            - AttributeName: journey_type
+              KeyType: HASH
+            - AttributeName: current_state
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # GSI: Query journeys by status, sorted by last update
+        # Use case: "Show all active journeys, most recently updated first"
+        - IndexName: by-status
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: updated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Table
+          Value: journeys
+
+  # ==========================================================================
+  #  Interactions Table
+  #  PK: customer_id, SK: timestamp#event_id
+  #  GSI: by-channel (channel, timestamp)
+  #  TTL: ttl attribute for automatic expiration
+  # ==========================================================================
+
+  InteractionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-interactions'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: timestamp_event_id
+          AttributeType: S
+        - AttributeName: channel
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+        - AttributeName: timestamp_event_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI: Query interactions by channel, sorted by time
+        # Use case: "Show all voice channel interactions in the last 24 hours"
+        - IndexName: by-channel
+          KeySchema:
+            - AttributeName: channel
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Table
+          Value: interactions
+
+  # ==========================================================================
+  #  Taxonomy Table
+  #  PK: domain, SK: intent
+  #  Stores the frozen taxonomy used for deterministic classification.
+  # ==========================================================================
+
+  TaxonomyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-taxonomy'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: domain
+          AttributeType: S
+        - AttributeName: intent
+          AttributeType: S
+      KeySchema:
+        - AttributeName: domain
+          KeyType: HASH
+        - AttributeName: intent
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Table
+          Value: taxonomy
+
+  # ==========================================================================
+  #  NBA Actions Table
+  #  PK: customer_id, SK: timestamp#action_id
+  #  TTL: ttl attribute for automatic cleanup of old actions
+  # ==========================================================================
+
+  NBAActionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-nba-actions'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: timestamp_action_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+        - AttributeName: timestamp_action_id
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Table
+          Value: nba-actions
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  CustomerProfilesTableName:
+    Description: Customer Profiles DynamoDB table name
+    Value: !Ref CustomerProfilesTable
+  CustomerProfilesTableArn:
+    Description: Customer Profiles DynamoDB table ARN
+    Value: !GetAtt CustomerProfilesTable.Arn
+
+  JourneysTableName:
+    Description: Journeys DynamoDB table name
+    Value: !Ref JourneysTable
+  JourneysTableArn:
+    Description: Journeys DynamoDB table ARN
+    Value: !GetAtt JourneysTable.Arn
+
+  InteractionsTableName:
+    Description: Interactions DynamoDB table name
+    Value: !Ref InteractionsTable
+  InteractionsTableArn:
+    Description: Interactions DynamoDB table ARN
+    Value: !GetAtt InteractionsTable.Arn
+
+  TaxonomyTableName:
+    Description: Taxonomy DynamoDB table name
+    Value: !Ref TaxonomyTable
+  TaxonomyTableArn:
+    Description: Taxonomy DynamoDB table ARN
+    Value: !GetAtt TaxonomyTable.Arn
+
+  NBAActionsTableName:
+    Description: NBA Actions DynamoDB table name
+    Value: !Ref NBAActionsTable
+  NBAActionsTableArn:
+    Description: NBA Actions DynamoDB table ARN
+    Value: !GetAtt NBAActionsTable.Arn

@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — Master Stack
+  Deploys all nested stacks for the 5-layer architecture:
+  Event Fabric, Deterministic Classifier, Journey State Machine,
+  NBA Engine, and Real-time Analytics.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Default: dev
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: cx-intelligence
+    MinLength: 3
+    MaxLength: 32
+    Description: Project name used as a prefix for all resources
+
+  NotificationEmail:
+    Type: String
+    MinLength: 5
+    MaxLength: 128
+    Description: Email address for operational alerts
+
+  TemplatesBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    Description: S3 bucket containing the nested CloudFormation templates
+
+  TemplatesPrefix:
+    Type: String
+    Default: cloudformation
+    Description: S3 key prefix for nested templates
+
+# ---------------------------------------------------------------------------
+# Mappings
+# ---------------------------------------------------------------------------
+Mappings:
+  EnvironmentConfig:
+    dev:
+      KinesisShardCount: 2
+      LambdaMemory: 256
+      LambdaTimeout: 30
+      DashboardRefreshSeconds: 300
+    staging:
+      KinesisShardCount: 4
+      LambdaMemory: 512
+      LambdaTimeout: 60
+      DashboardRefreshSeconds: 120
+    prod:
+      KinesisShardCount: 8
+      LambdaMemory: 1024
+      LambdaTimeout: 60
+      DashboardRefreshSeconds: 60
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  IsNotDev: !Not [!Equals [!Ref Environment, dev]]
+
+# ---------------------------------------------------------------------------
+# Resources — Nested Stacks
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------
+  # Layer 1: Data Stores (DynamoDB tables — no dependencies)
+  # -------------------------------------------------------
+  DataStoresStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/data-stores.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: data-stores
+
+  # -------------------------------------------------------
+  # Layer 2: Event Fabric (Kinesis, API Gateway, Firehose)
+  # -------------------------------------------------------
+  EventFabricStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/event-fabric.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ShardCount: !FindInMap [EnvironmentConfig, !Ref Environment, KinesisShardCount]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: event-fabric
+
+  # -------------------------------------------------------
+  # Layer 3: Processing (Lambdas for classification, identity, journey, NBA)
+  # -------------------------------------------------------
+  ProcessingStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - EventFabricStack
+      - DataStoresStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/processing.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LambdaMemory: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaMemory]
+        LambdaTimeout: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaTimeout]
+        RawEventsStreamArn: !GetAtt EventFabricStack.Outputs.RawEventsStreamArn
+        ClassifiedEventsStreamArn: !GetAtt EventFabricStack.Outputs.ClassifiedEventsStreamArn
+        ClassifiedEventsStreamName: !GetAtt EventFabricStack.Outputs.ClassifiedEventsStreamName
+        JourneyEventsStreamArn: !GetAtt EventFabricStack.Outputs.JourneyEventsStreamArn
+        JourneyEventsStreamName: !GetAtt EventFabricStack.Outputs.JourneyEventsStreamName
+        NBAEventsStreamArn: !GetAtt EventFabricStack.Outputs.NBAEventsStreamArn
+        NBAEventsStreamName: !GetAtt EventFabricStack.Outputs.NBAEventsStreamName
+        CustomerProfilesTableName: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableName
+        CustomerProfilesTableArn: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableArn
+        JourneysTableName: !GetAtt DataStoresStack.Outputs.JourneysTableName
+        JourneysTableArn: !GetAtt DataStoresStack.Outputs.JourneysTableArn
+        InteractionsTableName: !GetAtt DataStoresStack.Outputs.InteractionsTableName
+        InteractionsTableArn: !GetAtt DataStoresStack.Outputs.InteractionsTableArn
+        TaxonomyTableName: !GetAtt DataStoresStack.Outputs.TaxonomyTableName
+        TaxonomyTableArn: !GetAtt DataStoresStack.Outputs.TaxonomyTableArn
+        NBAActionsTableName: !GetAtt DataStoresStack.Outputs.NBAActionsTableName
+        NBAActionsTableArn: !GetAtt DataStoresStack.Outputs.NBAActionsTableArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: processing
+
+  # -------------------------------------------------------
+  # Layer 4: Orchestration (EventBridge, Step Functions)
+  # -------------------------------------------------------
+  OrchestrationStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ProcessingStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/orchestration.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LambdaMemory: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaMemory]
+        LambdaTimeout: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaTimeout]
+        NBAEvaluatorFunctionArn: !GetAtt ProcessingStack.Outputs.NBAEvaluatorFunctionArn
+        IdentityResolverFunctionArn: !GetAtt ProcessingStack.Outputs.IdentityResolverFunctionArn
+        CustomerProfilesTableName: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableName
+        CustomerProfilesTableArn: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableArn
+        JourneysTableName: !GetAtt DataStoresStack.Outputs.JourneysTableName
+        JourneysTableArn: !GetAtt DataStoresStack.Outputs.JourneysTableArn
+        NBAActionsTableName: !GetAtt DataStoresStack.Outputs.NBAActionsTableName
+        NBAActionsTableArn: !GetAtt DataStoresStack.Outputs.NBAActionsTableArn
+        NotificationEmail: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: orchestration
+
+  # -------------------------------------------------------
+  # Layer 5: Dashboard & Monitoring
+  # -------------------------------------------------------
+  DashboardStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - EventFabricStack
+      - ProcessingStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/dashboard.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        NotificationEmail: !Ref NotificationEmail
+        RawEventsStreamName: !GetAtt EventFabricStack.Outputs.RawEventsStreamName
+        ClassifiedEventsStreamName: !GetAtt EventFabricStack.Outputs.ClassifiedEventsStreamName
+        ClassifierFunctionName: !GetAtt ProcessingStack.Outputs.ClassifierFunctionName
+        JourneyProcessorFunctionName: !GetAtt ProcessingStack.Outputs.JourneyProcessorFunctionName
+        NBAEvaluatorFunctionName: !GetAtt ProcessingStack.Outputs.NBAEvaluatorFunctionName
+        IdentityResolverFunctionName: !GetAtt ProcessingStack.Outputs.IdentityResolverFunctionName
+        CustomerProfilesTableName: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableName
+        JourneysTableName: !GetAtt DataStoresStack.Outputs.JourneysTableName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: dashboard
+
+  # -------------------------------------------------------
+  # Layer 6: API Layer (REST API for dashboard consumption)
+  # -------------------------------------------------------
+  ApiLayerStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - DataStoresStack
+      - ProcessingStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/api-layer.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LambdaMemory: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaMemory]
+        LambdaTimeout: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaTimeout]
+        CustomerProfilesTableName: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableName
+        CustomerProfilesTableArn: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableArn
+        JourneysTableName: !GetAtt DataStoresStack.Outputs.JourneysTableName
+        JourneysTableArn: !GetAtt DataStoresStack.Outputs.JourneysTableArn
+        NBAActionsTableName: !GetAtt DataStoresStack.Outputs.NBAActionsTableName
+        NBAActionsTableArn: !GetAtt DataStoresStack.Outputs.NBAActionsTableArn
+        InteractionsTableName: !GetAtt DataStoresStack.Outputs.InteractionsTableName
+        InteractionsTableArn: !GetAtt DataStoresStack.Outputs.InteractionsTableArn
+        TaxonomyTableName: !GetAtt DataStoresStack.Outputs.TaxonomyTableName
+        TaxonomyTableArn: !GetAtt DataStoresStack.Outputs.TaxonomyTableArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Layer
+          Value: api-layer
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  # Event Fabric
+  EventIngestionApiUrl:
+    Description: REST API endpoint for event ingestion
+    Value: !GetAtt EventFabricStack.Outputs.EventIngestionApiUrl
+
+  RawEventsStreamArn:
+    Description: ARN of the raw events Kinesis stream
+    Value: !GetAtt EventFabricStack.Outputs.RawEventsStreamArn
+
+  DataLakeBucketName:
+    Description: S3 data lake bucket name
+    Value: !GetAtt EventFabricStack.Outputs.DataLakeBucketName
+
+  # Processing
+  ClassifierFunctionArn:
+    Description: ARN of the classifier Lambda function
+    Value: !GetAtt ProcessingStack.Outputs.ClassifierFunctionArn
+
+  # Data Stores
+  CustomerProfilesTableName:
+    Description: DynamoDB Customer Profiles table name
+    Value: !GetAtt DataStoresStack.Outputs.CustomerProfilesTableName
+
+  JourneysTableName:
+    Description: DynamoDB Journeys table name
+    Value: !GetAtt DataStoresStack.Outputs.JourneysTableName
+
+  # Orchestration
+  CXIntelligenceBusArn:
+    Description: ARN of the CX Intelligence EventBridge bus
+    Value: !GetAtt OrchestrationStack.Outputs.CXIntelligenceBusArn
+
+  JourneyOrchestratorArn:
+    Description: ARN of the Journey Orchestrator Step Function
+    Value: !GetAtt OrchestrationStack.Outputs.JourneyOrchestratorArn
+
+  # Dashboard
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !GetAtt DashboardStack.Outputs.DashboardUrl
+
+  AlertsTopicArn:
+    Description: SNS topic ARN for operational alerts
+    Value: !GetAtt DashboardStack.Outputs.AlertsTopicArn
+
+  # API Layer
+  DashboardApiUrl:
+    Description: REST API endpoint for dashboard queries
+    Value: !GetAtt ApiLayerStack.Outputs.DashboardApiUrl
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID for API authentication
+    Value: !GetAtt ApiLayerStack.Outputs.CognitoUserPoolId
+
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !GetAtt ApiLayerStack.Outputs.CognitoUserPoolClientId

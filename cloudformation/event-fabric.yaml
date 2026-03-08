@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — Event Fabric Layer
+  Kinesis Data Streams as the unified event backbone, API Gateway for
+  ingestion, Firehose delivery to S3 data lake, and event validation Lambda.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+
+  ShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 64
+    Description: Number of Kinesis shards per stream
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ==========================================================================
+  #  Kinesis Data Streams — unified event backbone
+  # ==========================================================================
+
+  RawEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-raw-events'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !If [IsProd, 168, 24]
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stream
+          Value: raw-events
+
+  ClassifiedEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-classified-events'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !If [IsProd, 168, 24]
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stream
+          Value: classified-events
+
+  JourneyEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-journey-events'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !If [IsProd, 168, 24]
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stream
+          Value: journey-events
+
+  NBAEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-nba-events'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !If [IsProd, 168, 24]
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stream
+          Value: nba-events
+
+  ActionEventsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-action-events'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !If [IsProd, 168, 24]
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stream
+          Value: action-events
+
+  # ==========================================================================
+  #  S3 Data Lake Bucket
+  # ==========================================================================
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-data-lake-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Move raw events to Intelligent-Tiering after 30 days
+          - Id: RawEventsLifecycle
+            Prefix: raw-events/
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          # Move classified events to Intelligent-Tiering after 30 days
+          - Id: ClassifiedEventsLifecycle
+            Prefix: classified-events/
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          # Move journey events to Glacier after 90 days
+          - Id: JourneyEventsArchive
+            Prefix: journey-events/
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 180
+          # Expire temporary/staging data after 7 days
+          - Id: TempDataCleanup
+            Prefix: tmp/
+            Status: Enabled
+            ExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  Firehose Delivery Streams — Kinesis to S3 data lake
+  # ==========================================================================
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-firehose-delivery'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FirehoseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+        - PolicyName: FirehoseKinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource:
+                  - !GetAtt RawEventsStream.Arn
+                  - !GetAtt ClassifiedEventsStream.Arn
+                  - !GetAtt JourneyEventsStream.Arn
+                  - !GetAtt NBAEventsStream.Arn
+                  - !GetAtt ActionEventsStream.Arn
+        - PolicyName: FirehoseKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/kinesis'
+
+  # Firehose: Raw Events -> S3
+  RawEventsFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-${Environment}-raw-events-to-s3'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt RawEventsStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        Prefix: !Sub 'raw-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: !Sub 'errors/raw-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/!{firehose:error-output-type}/'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: !If [IsProd, 60, 300]
+          SizeInMBs: !If [IsProd, 64, 5]
+        CompressionFormat: GZIP
+
+  # Firehose: Classified Events -> S3
+  ClassifiedEventsFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-${Environment}-classified-events-to-s3'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt ClassifiedEventsStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        Prefix: !Sub 'classified-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: !Sub 'errors/classified-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/!{firehose:error-output-type}/'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: !If [IsProd, 60, 300]
+          SizeInMBs: !If [IsProd, 64, 5]
+        CompressionFormat: GZIP
+
+  # Firehose: Journey Events -> S3
+  JourneyEventsFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-${Environment}-journey-events-to-s3'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt JourneyEventsStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        Prefix: !Sub 'journey-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: !Sub 'errors/journey-events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/!{firehose:error-output-type}/'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: !If [IsProd, 60, 300]
+          SizeInMBs: !If [IsProd, 64, 5]
+        CompressionFormat: GZIP
+
+  # ==========================================================================
+  #  Event Ingestion Validator Lambda
+  # ==========================================================================
+
+  EventValidatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-event-validator'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  EventValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-event-validator'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt RawEventsStream.Arn
+
+  EventValidatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: EventValidatorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-event-validator'
+      Description: Validates incoming events and writes to the raw events Kinesis stream
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt EventValidatorRole.Arn
+      Environment:
+        Variables:
+          RAW_EVENTS_STREAM: !Ref RawEventsStream
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          """
+          Event Ingestion Validator
+          Validates incoming CX events and writes to the raw events Kinesis stream.
+          Expects events with: event_id, event_type, channel, customer_id, timestamp, payload.
+          """
+          import json
+          import os
+          import time
+          import uuid
+          import boto3
+
+          kinesis = boto3.client('kinesis')
+          STREAM_NAME = os.environ['RAW_EVENTS_STREAM']
+
+          REQUIRED_FIELDS = ['event_type', 'channel', 'payload']
+          VALID_CHANNELS = [
+              'web', 'mobile', 'voice', 'chat', 'email',
+              'sms', 'social', 'in-store', 'iot'
+          ]
+
+          def validate_event(event):
+              """Validate a single event, returning errors or None."""
+              errors = []
+              for field in REQUIRED_FIELDS:
+                  if field not in event:
+                      errors.append(f'Missing required field: {field}')
+              if 'channel' in event and event['channel'] not in VALID_CHANNELS:
+                  errors.append(f'Invalid channel: {event["channel"]}')
+              return errors if errors else None
+
+          def enrich_event(event):
+              """Add server-side fields to the event."""
+              event.setdefault('event_id', str(uuid.uuid4()))
+              event.setdefault('timestamp', int(time.time() * 1000))
+              event['ingested_at'] = int(time.time() * 1000)
+              return event
+
+          def handler(event, context):
+              """Handle single or batch event ingestion."""
+              body = json.loads(event.get('body', '{}'))
+
+              # Determine if batch or single
+              events = body.get('events', [body]) if 'events' in body else [body]
+              results = {'accepted': 0, 'rejected': 0, 'errors': []}
+
+              records = []
+              for evt in events:
+                  validation_errors = validate_event(evt)
+                  if validation_errors:
+                      results['rejected'] += 1
+                      results['errors'].append({
+                          'event': evt.get('event_id', 'unknown'),
+                          'errors': validation_errors
+                      })
+                      continue
+
+                  enriched = enrich_event(evt)
+                  partition_key = enriched.get('customer_id', enriched['event_id'])
+                  records.append({
+                      'Data': json.dumps(enriched).encode('utf-8'),
+                      'PartitionKey': str(partition_key)
+                  })
+                  results['accepted'] += 1
+
+              # Write to Kinesis in batches of 500
+              if records:
+                  for i in range(0, len(records), 500):
+                      batch = records[i:i + 500]
+                      kinesis.put_records(StreamName=STREAM_NAME, Records=batch)
+
+              status_code = 200 if results['rejected'] == 0 else 207
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(results)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  API Gateway — REST API for event ingestion
+  # ==========================================================================
+
+  EventIngestionApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-event-ingestion'
+      Description: REST API for ingesting CX events into the platform
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # /events resource
+  EventsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      ParentId: !GetAtt EventIngestionApi.RootResourceId
+      PathPart: events
+
+  # /events/batch resource
+  EventsBatchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      ParentId: !Ref EventsResource
+      PathPart: batch
+
+  # Lambda permission for API Gateway
+  EventValidatorApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventValidatorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EventIngestionApi}/*'
+
+  # POST /events — single event ingestion
+  EventsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      ResourceId: !Ref EventsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EventValidatorFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+
+  # POST /events/batch — batch event ingestion
+  EventsBatchPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      ResourceId: !Ref EventsBatchResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EventValidatorFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+
+  # OPTIONS /events — CORS preflight
+  EventsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      ResourceId: !Ref EventsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /events/batch — CORS preflight
+  EventsBatchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      ResourceId: !Ref EventsBatchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Deployment
+  EventIngestionApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EventsPostMethod
+      - EventsBatchPostMethod
+      - EventsOptionsMethod
+      - EventsBatchOptionsMethod
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+
+  # API Stage
+  EventIngestionApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref EventIngestionApi
+      DeploymentId: !Ref EventIngestionApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage for event ingestion API'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: !If [IsProd, 5000, 500]
+          ThrottlingRateLimit: !If [IsProd, 10000, 1000]
+          MetricsEnabled: true
+          DataTraceEnabled: !If [IsProd, false, true]
+          LoggingLevel: !If [IsProd, ERROR, INFO]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  # Stream ARNs
+  RawEventsStreamArn:
+    Description: ARN of the raw events Kinesis stream
+    Value: !GetAtt RawEventsStream.Arn
+  RawEventsStreamName:
+    Description: Name of the raw events Kinesis stream
+    Value: !Ref RawEventsStream
+
+  ClassifiedEventsStreamArn:
+    Description: ARN of the classified events Kinesis stream
+    Value: !GetAtt ClassifiedEventsStream.Arn
+  ClassifiedEventsStreamName:
+    Description: Name of the classified events Kinesis stream
+    Value: !Ref ClassifiedEventsStream
+
+  JourneyEventsStreamArn:
+    Description: ARN of the journey events Kinesis stream
+    Value: !GetAtt JourneyEventsStream.Arn
+  JourneyEventsStreamName:
+    Description: Name of the journey events Kinesis stream
+    Value: !Ref JourneyEventsStream
+
+  NBAEventsStreamArn:
+    Description: ARN of the NBA events Kinesis stream
+    Value: !GetAtt NBAEventsStream.Arn
+  NBAEventsStreamName:
+    Description: Name of the NBA events Kinesis stream
+    Value: !Ref NBAEventsStream
+
+  ActionEventsStreamArn:
+    Description: ARN of the action events Kinesis stream
+    Value: !GetAtt ActionEventsStream.Arn
+  ActionEventsStreamName:
+    Description: Name of the action events Kinesis stream
+    Value: !Ref ActionEventsStream
+
+  # API Gateway
+  EventIngestionApiUrl:
+    Description: Event ingestion REST API URL
+    Value: !Sub 'https://${EventIngestionApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+  EventIngestionApiId:
+    Description: Event ingestion REST API ID
+    Value: !Ref EventIngestionApi
+
+  # S3 Data Lake
+  DataLakeBucketName:
+    Description: S3 data lake bucket name
+    Value: !Ref DataLakeBucket
+  DataLakeBucketArn:
+    Description: S3 data lake bucket ARN
+    Value: !GetAtt DataLakeBucket.Arn
+
+  # Validator Lambda
+  EventValidatorFunctionArn:
+    Description: ARN of the event validator Lambda
+    Value: !GetAtt EventValidatorFunction.Arn

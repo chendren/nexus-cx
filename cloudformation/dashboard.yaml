@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — Dashboard & Monitoring Layer
+  CloudWatch Dashboard with operational widgets, SNS alert topic,
+  and CloudWatch Alarms for Lambda errors, Kinesis iterator age,
+  and DynamoDB throttling.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+
+  NotificationEmail:
+    Type: String
+    MinLength: 5
+    MaxLength: 128
+
+  # Resource names from other stacks
+  RawEventsStreamName:
+    Type: String
+  ClassifiedEventsStreamName:
+    Type: String
+  ClassifierFunctionName:
+    Type: String
+  JourneyProcessorFunctionName:
+    Type: String
+  NBAEvaluatorFunctionName:
+    Type: String
+  IdentityResolverFunctionName:
+    Type: String
+  CustomerProfilesTableName:
+    Type: String
+  JourneysTableName:
+    Type: String
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ==========================================================================
+  #  SNS Alert Topic
+  # ==========================================================================
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ==========================================================================
+  #  CloudWatch Alarms
+  # ==========================================================================
+
+  # Alarm: Classifier Lambda error rate > 5%
+  ClassifierErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-classifier-errors'
+      AlarmDescription: Classifier Lambda error rate exceeds 5%
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ClassifierFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: Journey Processor Lambda error rate
+  JourneyProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-journey-processor-errors'
+      AlarmDescription: Journey Processor Lambda error rate exceeds threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JourneyProcessorFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: NBA Evaluator Lambda error rate
+  NBAEvaluatorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-nba-evaluator-errors'
+      AlarmDescription: NBA Evaluator Lambda error rate exceeds threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NBAEvaluatorFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: Identity Resolver Lambda error rate
+  IdentityResolverErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-identity-resolver-errors'
+      AlarmDescription: Identity Resolver Lambda error rate exceeds threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IdentityResolverFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: Raw Events stream iterator age > 60 seconds
+  RawEventsIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-raw-events-iterator-age'
+      AlarmDescription: Raw events Kinesis stream iterator age exceeds 60 seconds — consumers are falling behind
+      Namespace: AWS/Kinesis
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref RawEventsStreamName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: Classified Events stream iterator age > 60 seconds
+  ClassifiedEventsIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-classified-events-iterator-age'
+      AlarmDescription: Classified events Kinesis stream iterator age exceeds 60 seconds
+      Namespace: AWS/Kinesis
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref ClassifiedEventsStreamName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: Customer Profiles table throttling
+  CustomerProfilesThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-customer-profiles-throttle'
+      AlarmDescription: Customer Profiles DynamoDB table experiencing throttling
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref CustomerProfilesTableName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Alarm: Journeys table throttling
+  JourneysThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-journeys-throttle'
+      AlarmDescription: Journeys DynamoDB table experiencing throttling
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref JourneysTableName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================================================
+  #  CloudWatch Dashboard
+  # ==========================================================================
+
+  OperationalDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-operations'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "# CX Intelligence Platform — ${Environment} Environment"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 1,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Events Processed Per Minute",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingRecords", "StreamName", "${RawEventsStreamName}", {"stat": "Sum", "period": 60, "label": "Raw Events"}],
+                  ["AWS/Kinesis", "IncomingRecords", "StreamName", "${ClassifiedEventsStreamName}", {"stat": "Sum", "period": 60, "label": "Classified Events"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 1,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Kinesis Iterator Age (Consumer Lag)",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", "StreamName", "${RawEventsStreamName}", {"stat": "Maximum", "period": 60, "label": "Raw Events"}],
+                  ["AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", "StreamName", "${ClassifiedEventsStreamName}", {"stat": "Maximum", "period": 60, "label": "Classified Events"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60,
+                "yAxis": {"left": {"label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 7,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Invocations",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ClassifierFunctionName}", {"stat": "Sum", "period": 60, "label": "Classifier"}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${IdentityResolverFunctionName}", {"stat": "Sum", "period": 60, "label": "Identity Resolver"}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${JourneyProcessorFunctionName}", {"stat": "Sum", "period": 60, "label": "Journey Processor"}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${NBAEvaluatorFunctionName}", {"stat": "Sum", "period": 60, "label": "NBA Evaluator"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 7,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Error Rates",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ClassifierFunctionName}", {"stat": "Sum", "period": 300, "label": "Classifier"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IdentityResolverFunctionName}", {"stat": "Sum", "period": 300, "label": "Identity Resolver"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${JourneyProcessorFunctionName}", {"stat": "Sum", "period": 300, "label": "Journey Processor"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${NBAEvaluatorFunctionName}", {"stat": "Sum", "period": 300, "label": "NBA Evaluator"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 13,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Duration (p99)",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ClassifierFunctionName}", {"stat": "p99", "period": 300, "label": "Classifier"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${IdentityResolverFunctionName}", {"stat": "p99", "period": 300, "label": "Identity Resolver"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${JourneyProcessorFunctionName}", {"stat": "p99", "period": 300, "label": "Journey Processor"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${NBAEvaluatorFunctionName}", {"stat": "p99", "period": 300, "label": "NBA Evaluator"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 300,
+                "yAxis": {"left": {"label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 13,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Concurrent Executions",
+                "view": "timeSeries",
+                "stacked": true,
+                "metrics": [
+                  ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${ClassifierFunctionName}", {"stat": "Maximum", "period": 60, "label": "Classifier"}],
+                  ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${IdentityResolverFunctionName}", {"stat": "Maximum", "period": 60, "label": "Identity Resolver"}],
+                  ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${JourneyProcessorFunctionName}", {"stat": "Maximum", "period": 60, "label": "Journey Processor"}],
+                  ["AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${NBAEvaluatorFunctionName}", {"stat": "Maximum", "period": 60, "label": "NBA Evaluator"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 19,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "DynamoDB Read/Write Capacity",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${CustomerProfilesTableName}", {"stat": "Sum", "period": 300, "label": "Profiles Reads"}],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${CustomerProfilesTableName}", {"stat": "Sum", "period": 300, "label": "Profiles Writes"}],
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${JourneysTableName}", {"stat": "Sum", "period": 300, "label": "Journeys Reads"}],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${JourneysTableName}", {"stat": "Sum", "period": 300, "label": "Journeys Writes"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 19,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "DynamoDB Throttled Requests",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/DynamoDB", "ThrottledRequests", "TableName", "${CustomerProfilesTableName}", {"stat": "Sum", "period": 300, "label": "Profiles"}],
+                  ["AWS/DynamoDB", "ThrottledRequests", "TableName", "${JourneysTableName}", {"stat": "Sum", "period": 300, "label": "Journeys"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 25,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "title": "Kinesis Throughput (Bytes/Second)",
+                "view": "timeSeries",
+                "stacked": false,
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingBytes", "StreamName", "${RawEventsStreamName}", {"stat": "Sum", "period": 60, "label": "Raw Events In"}],
+                  ["AWS/Kinesis", "GetRecords.Bytes", "StreamName", "${RawEventsStreamName}", {"stat": "Sum", "period": 60, "label": "Raw Events Out"}],
+                  ["AWS/Kinesis", "IncomingBytes", "StreamName", "${ClassifiedEventsStreamName}", {"stat": "Sum", "period": 60, "label": "Classified Events In"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            }
+          ]
+        }
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  DashboardUrl:
+    Description: URL of the CloudWatch Operations Dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-operations'
+
+  AlertsTopicArn:
+    Description: ARN of the alerts SNS topic
+    Value: !Ref AlertsTopic
+
+  AlertsTopicName:
+    Description: Name of the alerts SNS topic
+    Value: !GetAtt AlertsTopic.TopicName

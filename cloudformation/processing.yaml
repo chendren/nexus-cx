@@ -1,0 +1,1127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nexus CX Intelligence Platform — Processing Layer
+  Lambda functions for deterministic classification, identity resolution,
+  journey state processing, and next-best-action evaluation.
+  Includes shared Lambda Layer and Kinesis event source mappings.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    MinLength: 3
+    MaxLength: 32
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 900
+
+  # Kinesis stream references from Event Fabric stack
+  RawEventsStreamArn:
+    Type: String
+  ClassifiedEventsStreamArn:
+    Type: String
+  ClassifiedEventsStreamName:
+    Type: String
+  JourneyEventsStreamArn:
+    Type: String
+  JourneyEventsStreamName:
+    Type: String
+  NBAEventsStreamArn:
+    Type: String
+  NBAEventsStreamName:
+    Type: String
+
+  # DynamoDB table references from Data Stores stack
+  CustomerProfilesTableName:
+    Type: String
+  CustomerProfilesTableArn:
+    Type: String
+  JourneysTableName:
+    Type: String
+  JourneysTableArn:
+    Type: String
+  InteractionsTableName:
+    Type: String
+  InteractionsTableArn:
+    Type: String
+  TaxonomyTableName:
+    Type: String
+  TaxonomyTableArn:
+    Type: String
+  NBAActionsTableName:
+    Type: String
+  NBAActionsTableArn:
+    Type: String
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ==========================================================================
+  #  Shared Lambda Layer — classification logic, taxonomy, utilities
+  # ==========================================================================
+
+  ClassificationLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-${Environment}-classification-layer'
+      Description: Shared classification logic, taxonomy definitions, and utility functions
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        ZipFile: |
+          # Placeholder — deploy actual layer from CI/CD pipeline.
+          # Layer contents (in python/lib/python3.12/site-packages/):
+          #   cx_taxonomy/   — frozen taxonomy definitions
+          #   cx_classify/   — embedding-based classifier
+          #   cx_utils/      — shared utilities (logging, metrics, error handling)
+
+  # ==========================================================================
+  #  Classifier Function — reads raw events, classifies, writes to classified stream
+  # ==========================================================================
+
+  ClassifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-classifier'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  ClassifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-classifier'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisReadRawEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                  - kinesis:SubscribeToShard
+                Resource: !Ref RawEventsStreamArn
+        - PolicyName: KinesisWriteClassified
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !Ref ClassifiedEventsStreamArn
+        - PolicyName: ReadTaxonomy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref TaxonomyTableArn
+                  - !Sub '${TaxonomyTableArn}/index/*'
+        - PolicyName: WriteInteractions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Ref InteractionsTableArn
+
+  ClassifierFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ClassifierLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-classifier'
+      Description: >
+        Deterministic classifier — reads raw events from Kinesis, classifies
+        using embedding-based taxonomy matching, writes classified events.
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt ClassifierRole.Arn
+      Layers:
+        - !Ref ClassificationLayer
+      Environment:
+        Variables:
+          CLASSIFIED_EVENTS_STREAM: !Ref ClassifiedEventsStreamName
+          TAXONOMY_TABLE: !Ref TaxonomyTableName
+          INTERACTIONS_TABLE: !Ref InteractionsTableName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          """
+          Deterministic Classifier
+          Reads raw events from Kinesis, classifies against the frozen taxonomy,
+          enriches with classification metadata, and writes to the classified events stream.
+          """
+          import json
+          import os
+          import base64
+          import time
+          import boto3
+
+          kinesis = boto3.client('kinesis')
+          dynamodb = boto3.resource('dynamodb')
+
+          STREAM = os.environ['CLASSIFIED_EVENTS_STREAM']
+          TAXONOMY_TABLE = os.environ['TAXONOMY_TABLE']
+          INTERACTIONS_TABLE = os.environ['INTERACTIONS_TABLE']
+
+          taxonomy_table = dynamodb.Table(TAXONOMY_TABLE)
+          interactions_table = dynamodb.Table(INTERACTIONS_TABLE)
+
+          # Cache taxonomy in memory across invocations
+          _taxonomy_cache = {}
+          _taxonomy_loaded_at = 0
+
+          def load_taxonomy():
+              global _taxonomy_cache, _taxonomy_loaded_at
+              now = time.time()
+              # Refresh every 5 minutes
+              if now - _taxonomy_loaded_at < 300 and _taxonomy_cache:
+                  return _taxonomy_cache
+              response = taxonomy_table.scan()
+              _taxonomy_cache = {}
+              for item in response.get('Items', []):
+                  domain = item['domain']
+                  intent = item['intent']
+                  _taxonomy_cache.setdefault(domain, {})[intent] = item
+              _taxonomy_loaded_at = now
+              return _taxonomy_cache
+
+          def classify_event(event, taxonomy):
+              """
+              Classify event using deterministic keyword + embedding matching.
+              Returns classification dict with domain, intent, confidence.
+              """
+              event_type = event.get('event_type', '')
+              payload = event.get('payload', {})
+              text = payload.get('text', payload.get('description', ''))
+
+              # Deterministic classification based on event_type mapping
+              classification = {
+                  'domain': 'unknown',
+                  'intent': 'unclassified',
+                  'confidence': 0.0,
+                  'method': 'deterministic'
+              }
+
+              # Map common event types to taxonomy domains
+              type_domain_map = {
+                  'page_view': 'engagement',
+                  'purchase': 'commerce',
+                  'cart_add': 'commerce',
+                  'cart_abandon': 'commerce',
+                  'support_ticket': 'support',
+                  'chat_start': 'support',
+                  'complaint': 'support',
+                  'survey_response': 'feedback',
+                  'nps_response': 'feedback',
+                  'email_open': 'engagement',
+                  'click': 'engagement'
+              }
+
+              if event_type in type_domain_map:
+                  classification['domain'] = type_domain_map[event_type]
+                  classification['intent'] = event_type
+                  classification['confidence'] = 0.95
+
+              return classification
+
+          def handler(event, context):
+              taxonomy = load_taxonomy()
+              records_out = []
+              interaction_items = []
+
+              for record in event['Records']:
+                  payload = json.loads(
+                      base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  )
+
+                  classification = classify_event(payload, taxonomy)
+                  payload['classification'] = classification
+                  payload['classified_at'] = int(time.time() * 1000)
+
+                  partition_key = payload.get('customer_id', payload.get('event_id', 'unknown'))
+                  records_out.append({
+                      'Data': json.dumps(payload).encode('utf-8'),
+                      'PartitionKey': str(partition_key)
+                  })
+
+                  # Write interaction record
+                  if payload.get('customer_id'):
+                      interaction_items.append({
+                          'customer_id': payload['customer_id'],
+                          'timestamp_event_id': f"{payload.get('timestamp', int(time.time()*1000))}#{payload.get('event_id', 'unknown')}",
+                          'channel': payload.get('channel', 'unknown'),
+                          'event_type': payload.get('event_type', 'unknown'),
+                          'classification': classification,
+                          'ttl': int(time.time()) + (90 * 86400)  # 90-day TTL
+                      })
+
+              # Write classified events to Kinesis
+              for i in range(0, len(records_out), 500):
+                  batch = records_out[i:i + 500]
+                  kinesis.put_records(StreamName=STREAM, Records=batch)
+
+              # Write interactions to DynamoDB
+              with interactions_table.batch_writer() as writer:
+                  for item in interaction_items:
+                      writer.put_item(Item=item)
+
+              return {'statusCode': 200, 'processed': len(records_out)}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis -> Classifier event source mapping
+  ClassifierEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref RawEventsStreamArn
+      FunctionName: !Ref ClassifierFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: !If [IsProd, 100, 10]
+      MaximumBatchingWindowInSeconds: !If [IsProd, 5, 30]
+      ParallelizationFactor: !If [IsProd, 10, 1]
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+
+  # ==========================================================================
+  #  Identity Resolver Function
+  # ==========================================================================
+
+  IdentityResolverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-identity-resolver'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  IdentityResolverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-identity-resolver'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisReadClassified
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !Ref ClassifiedEventsStreamArn
+        - PolicyName: CustomerProfilesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref CustomerProfilesTableArn
+                  - !Sub '${CustomerProfilesTableArn}/index/*'
+        - PolicyName: KinesisWriteJourney
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !Ref JourneyEventsStreamArn
+
+  IdentityResolverFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IdentityResolverLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-identity-resolver'
+      Description: >
+        Resolves customer identity by stitching anonymous sessions to known
+        profiles using email, phone, device ID, and cookie-based matching.
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt IdentityResolverRole.Arn
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTableName
+          JOURNEY_EVENTS_STREAM: !Ref JourneyEventsStreamName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          """
+          Identity Resolver
+          Reads classified events, resolves customer identity via GSI lookups
+          (email, phone), creates or updates customer profiles, and forwards
+          identity-enriched events to the journey events stream.
+          """
+          import json
+          import os
+          import base64
+          import time
+          import uuid
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          kinesis = boto3.client('kinesis')
+          dynamodb = boto3.resource('dynamodb')
+
+          PROFILES_TABLE = os.environ['CUSTOMER_PROFILES_TABLE']
+          JOURNEY_STREAM = os.environ['JOURNEY_EVENTS_STREAM']
+
+          profiles_table = dynamodb.Table(PROFILES_TABLE)
+
+          def resolve_identity(event):
+              """
+              Attempt to resolve customer identity from event attributes.
+              Returns resolved customer_id and profile data.
+              """
+              customer_id = event.get('customer_id')
+              email = event.get('payload', {}).get('email')
+              phone = event.get('payload', {}).get('phone')
+
+              # If we already have a customer_id, look up the profile
+              if customer_id:
+                  response = profiles_table.get_item(Key={'customer_id': customer_id})
+                  if 'Item' in response:
+                      return customer_id, response['Item']
+
+              # Try email-based resolution
+              if email:
+                  response = profiles_table.query(
+                      IndexName='by-email',
+                      KeyConditionExpression=Key('email').eq(email),
+                      Limit=1
+                  )
+                  if response.get('Items'):
+                      profile = response['Items'][0]
+                      return profile['customer_id'], profile
+
+              # Try phone-based resolution
+              if phone:
+                  response = profiles_table.query(
+                      IndexName='by-phone',
+                      KeyConditionExpression=Key('phone').eq(phone),
+                      Limit=1
+                  )
+                  if response.get('Items'):
+                      profile = response['Items'][0]
+                      return profile['customer_id'], profile
+
+              # Create new profile for unknown customers
+              new_id = customer_id or str(uuid.uuid4())
+              new_profile = {
+                  'customer_id': new_id,
+                  'created_at': int(time.time() * 1000),
+                  'updated_at': int(time.time() * 1000),
+                  'channels_seen': [event.get('channel', 'unknown')],
+                  'total_interactions': 1
+              }
+              if email:
+                  new_profile['email'] = email
+              if phone:
+                  new_profile['phone'] = phone
+
+              profiles_table.put_item(Item=new_profile)
+              return new_id, new_profile
+
+          def handler(event, context):
+              records_out = []
+
+              for record in event['Records']:
+                  payload = json.loads(
+                      base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  )
+
+                  customer_id, profile = resolve_identity(payload)
+
+                  # Enrich event with resolved identity
+                  payload['customer_id'] = customer_id
+                  payload['identity_resolved'] = True
+                  payload['identity_resolved_at'] = int(time.time() * 1000)
+
+                  # Update profile with latest channel interaction
+                  channel = payload.get('channel', 'unknown')
+                  profiles_table.update_item(
+                      Key={'customer_id': customer_id},
+                      UpdateExpression='SET updated_at = :now, last_channel = :ch ADD channels_seen :chs, total_interactions :one',
+                      ExpressionAttributeValues={
+                          ':now': int(time.time() * 1000),
+                          ':ch': channel,
+                          ':chs': {channel},
+                          ':one': 1
+                      }
+                  )
+
+                  records_out.append({
+                      'Data': json.dumps(payload).encode('utf-8'),
+                      'PartitionKey': customer_id
+                  })
+
+              # Write to journey events stream
+              for i in range(0, len(records_out), 500):
+                  batch = records_out[i:i + 500]
+                  kinesis.put_records(StreamName=JOURNEY_STREAM, Records=batch)
+
+              return {'statusCode': 200, 'processed': len(records_out)}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis -> Identity Resolver event source mapping
+  IdentityResolverEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref ClassifiedEventsStreamArn
+      FunctionName: !Ref IdentityResolverFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: !If [IsProd, 100, 10]
+      MaximumBatchingWindowInSeconds: !If [IsProd, 5, 30]
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+
+  # ==========================================================================
+  #  Journey Processor Function
+  # ==========================================================================
+
+  JourneyProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-journey-processor'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  JourneyProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-journey-processor'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisReadJourneyEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !Ref JourneyEventsStreamArn
+        - PolicyName: JourneysTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref JourneysTableArn
+                  - !Sub '${JourneysTableArn}/index/*'
+        - PolicyName: KinesisWriteNBA
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !Ref NBAEventsStreamArn
+
+  JourneyProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: JourneyProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-journey-processor'
+      Description: >
+        Journey State Machine — tracks customer journeys across channels,
+        manages state transitions, and triggers NBA evaluation on state changes.
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt JourneyProcessorRole.Arn
+      Environment:
+        Variables:
+          JOURNEYS_TABLE: !Ref JourneysTableName
+          NBA_EVENTS_STREAM: !Ref NBAEventsStreamName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          """
+          Journey Processor
+          Manages the customer journey state machine. Reads identity-resolved
+          events, updates journey states in DynamoDB, and emits state-change
+          events to the NBA stream for next-best-action evaluation.
+          """
+          import json
+          import os
+          import base64
+          import time
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          kinesis = boto3.client('kinesis')
+          dynamodb = boto3.resource('dynamodb')
+
+          JOURNEYS_TABLE = os.environ['JOURNEYS_TABLE']
+          NBA_STREAM = os.environ['NBA_EVENTS_STREAM']
+
+          journeys_table = dynamodb.Table(JOURNEYS_TABLE)
+
+          # Journey type definitions and valid state transitions
+          JOURNEY_DEFINITIONS = {
+              'purchase': {
+                  'initial': 'browsing',
+                  'states': {
+                      'browsing': ['considering', 'abandoned'],
+                      'considering': ['cart_added', 'abandoned'],
+                      'cart_added': ['checkout_started', 'abandoned'],
+                      'checkout_started': ['purchased', 'abandoned'],
+                      'purchased': ['post_purchase'],
+                      'post_purchase': ['completed', 'support_needed'],
+                      'support_needed': ['resolved', 'escalated'],
+                      'resolved': ['completed'],
+                      'escalated': ['resolved'],
+                      'abandoned': ['browsing'],  # Can re-enter
+                      'completed': []
+                  }
+              },
+              'support': {
+                  'initial': 'ticket_created',
+                  'states': {
+                      'ticket_created': ['in_progress', 'awaiting_customer'],
+                      'in_progress': ['awaiting_customer', 'resolved', 'escalated'],
+                      'awaiting_customer': ['in_progress', 'resolved', 'abandoned'],
+                      'escalated': ['in_progress', 'resolved'],
+                      'resolved': ['completed', 'reopened'],
+                      'reopened': ['in_progress', 'escalated'],
+                      'abandoned': [],
+                      'completed': []
+                  }
+              },
+              'onboarding': {
+                  'initial': 'registered',
+                  'states': {
+                      'registered': ['profile_created', 'abandoned'],
+                      'profile_created': ['first_interaction', 'abandoned'],
+                      'first_interaction': ['activated', 'stalled'],
+                      'activated': ['completed'],
+                      'stalled': ['first_interaction', 'abandoned'],
+                      'abandoned': [],
+                      'completed': []
+                  }
+              }
+          }
+
+          # Map event types to journey state transitions
+          EVENT_STATE_MAP = {
+              'page_view': ('purchase', 'browsing'),
+              'product_view': ('purchase', 'considering'),
+              'cart_add': ('purchase', 'cart_added'),
+              'checkout_start': ('purchase', 'checkout_started'),
+              'purchase': ('purchase', 'purchased'),
+              'support_ticket': ('support', 'ticket_created'),
+              'complaint': ('support', 'escalated'),
+              'registration': ('onboarding', 'registered'),
+          }
+
+          def get_or_create_journey(customer_id, journey_type, definition):
+              """Get existing active journey or create a new one."""
+              journey_key = f'{journey_type}#active'
+              response = journeys_table.get_item(
+                  Key={'customer_id': customer_id, 'journey_key': journey_key}
+              )
+              if 'Item' in response:
+                  return response['Item'], False
+
+              now = int(time.time() * 1000)
+              journey = {
+                  'customer_id': customer_id,
+                  'journey_key': journey_key,
+                  'journey_type': journey_type,
+                  'current_state': definition['initial'],
+                  'previous_state': None,
+                  'status': 'active',
+                  'created_at': now,
+                  'updated_at': now,
+                  'state_history': [{'state': definition['initial'], 'timestamp': now}],
+                  'interaction_count': 0,
+                  'channels_used': []
+              }
+              journeys_table.put_item(Item=journey)
+              return journey, True
+
+          def transition_state(journey, new_state, definition):
+              """Attempt a state transition, returns True if valid."""
+              current = journey['current_state']
+              valid_next = definition['states'].get(current, [])
+              if new_state in valid_next:
+                  return True
+              return False
+
+          def handler(event, context):
+              nba_records = []
+
+              for record in event['Records']:
+                  payload = json.loads(
+                      base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  )
+
+                  customer_id = payload.get('customer_id')
+                  event_type = payload.get('event_type', '')
+
+                  if not customer_id or event_type not in EVENT_STATE_MAP:
+                      continue
+
+                  journey_type, target_state = EVENT_STATE_MAP[event_type]
+                  definition = JOURNEY_DEFINITIONS.get(journey_type)
+                  if not definition:
+                      continue
+
+                  journey, is_new = get_or_create_journey(customer_id, journey_type, definition)
+
+                  if is_new or transition_state(journey, target_state, definition):
+                      now = int(time.time() * 1000)
+                      previous_state = journey['current_state']
+                      channel = payload.get('channel', 'unknown')
+
+                      # Update journey in DynamoDB
+                      journeys_table.update_item(
+                          Key={
+                              'customer_id': customer_id,
+                              'journey_key': journey['journey_key']
+                          },
+                          UpdateExpression=(
+                              'SET current_state = :ns, previous_state = :ps, '
+                              'updated_at = :now, '
+                              'state_history = list_append(state_history, :sh) '
+                              'ADD interaction_count :one, channels_used :ch'
+                          ),
+                          ExpressionAttributeValues={
+                              ':ns': target_state,
+                              ':ps': previous_state,
+                              ':now': now,
+                              ':sh': [{'state': target_state, 'timestamp': now, 'channel': channel}],
+                              ':one': 1,
+                              ':ch': {channel}
+                          }
+                      )
+
+                      # Emit state change event for NBA evaluation
+                      nba_event = {
+                          'event_type': 'journey_state_change',
+                          'customer_id': customer_id,
+                          'journey_type': journey_type,
+                          'previous_state': previous_state,
+                          'current_state': target_state,
+                          'channel': channel,
+                          'timestamp': now,
+                          'source_event': payload
+                      }
+                      nba_records.append({
+                          'Data': json.dumps(nba_event).encode('utf-8'),
+                          'PartitionKey': customer_id
+                      })
+
+              # Write NBA evaluation triggers
+              if nba_records:
+                  for i in range(0, len(nba_records), 500):
+                      batch = nba_records[i:i + 500]
+                      kinesis.put_records(StreamName=NBA_STREAM, Records=batch)
+
+              return {'statusCode': 200, 'processed': len(nba_records)}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis -> Journey Processor event source mapping
+  JourneyProcessorEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref JourneyEventsStreamArn
+      FunctionName: !Ref JourneyProcessorFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: !If [IsProd, 100, 10]
+      MaximumBatchingWindowInSeconds: !If [IsProd, 5, 30]
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+
+  # ==========================================================================
+  #  NBA Evaluator Function
+  # ==========================================================================
+
+  NBAEvaluatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-nba-evaluator'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  NBAEvaluatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-nba-evaluator'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisReadNBAEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !Ref NBAEventsStreamArn
+        - PolicyName: CustomerProfileRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref CustomerProfilesTableArn
+                  - !Sub '${CustomerProfilesTableArn}/index/*'
+        - PolicyName: JourneysRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref JourneysTableArn
+                  - !Sub '${JourneysTableArn}/index/*'
+        - PolicyName: NBAActionsWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref NBAActionsTableArn
+                  - !Sub '${NBAActionsTableArn}/index/*'
+        - PolicyName: EventBridgePut
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/*'
+
+  NBAEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NBAEvaluatorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-nba-evaluator'
+      Description: >
+        Next-Best-Action Evaluator — evaluates rules based on journey state
+        changes, customer profile, and interaction history to determine
+        the optimal next action and delivery channel.
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt NBAEvaluatorRole.Arn
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTableName
+          JOURNEYS_TABLE: !Ref JourneysTableName
+          NBA_ACTIONS_TABLE: !Ref NBAActionsTableName
+          ENVIRONMENT: !Ref Environment
+          EVENT_BUS_NAME: !Sub '${ProjectName}-${Environment}-cx-intelligence'
+      Code:
+        ZipFile: |
+          """
+          NBA Evaluator
+          Reads journey state change events, evaluates next-best-action rules
+          based on customer context, and writes action recommendations to
+          DynamoDB and EventBridge for downstream delivery.
+          """
+          import json
+          import os
+          import base64
+          import time
+          import uuid
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          kinesis = boto3.client('kinesis')
+          dynamodb = boto3.resource('dynamodb')
+          events_client = boto3.client('events')
+
+          PROFILES_TABLE = os.environ['CUSTOMER_PROFILES_TABLE']
+          JOURNEYS_TABLE = os.environ['JOURNEYS_TABLE']
+          NBA_TABLE = os.environ['NBA_ACTIONS_TABLE']
+          EVENT_BUS = os.environ['EVENT_BUS_NAME']
+
+          profiles_table = dynamodb.Table(PROFILES_TABLE)
+          journeys_table = dynamodb.Table(JOURNEYS_TABLE)
+          nba_table = dynamodb.Table(NBA_TABLE)
+
+          # NBA rules engine — maps journey state changes to actions
+          NBA_RULES = {
+              ('purchase', 'abandoned'): {
+                  'action_type': 'cart_recovery',
+                  'urgency': 'high',
+                  'preferred_channels': ['email', 'sms', 'push'],
+                  'delay_seconds': 3600,  # 1 hour delay
+                  'message_template': 'cart_abandonment_recovery'
+              },
+              ('purchase', 'considering'): {
+                  'action_type': 'product_recommendation',
+                  'urgency': 'medium',
+                  'preferred_channels': ['web', 'email'],
+                  'delay_seconds': 0,
+                  'message_template': 'similar_products'
+              },
+              ('purchase', 'purchased'): {
+                  'action_type': 'post_purchase_followup',
+                  'urgency': 'low',
+                  'preferred_channels': ['email'],
+                  'delay_seconds': 86400,  # 24 hour delay
+                  'message_template': 'order_confirmation_upsell'
+              },
+              ('support', 'escalated'): {
+                  'action_type': 'priority_support',
+                  'urgency': 'critical',
+                  'preferred_channels': ['voice', 'chat'],
+                  'delay_seconds': 0,
+                  'message_template': 'escalation_acknowledgment'
+              },
+              ('support', 'awaiting_customer'): {
+                  'action_type': 'customer_reminder',
+                  'urgency': 'medium',
+                  'preferred_channels': ['sms', 'email'],
+                  'delay_seconds': 43200,  # 12 hours
+                  'message_template': 'awaiting_response_reminder'
+              },
+              ('onboarding', 'stalled'): {
+                  'action_type': 'onboarding_nudge',
+                  'urgency': 'high',
+                  'preferred_channels': ['email', 'push'],
+                  'delay_seconds': 7200,  # 2 hours
+                  'message_template': 'complete_onboarding'
+              }
+          }
+
+          def evaluate_nba(state_change_event, profile):
+              """Evaluate NBA rules and return recommended action."""
+              journey_type = state_change_event.get('journey_type')
+              current_state = state_change_event.get('current_state')
+
+              rule_key = (journey_type, current_state)
+              rule = NBA_RULES.get(rule_key)
+
+              if not rule:
+                  return None
+
+              # Select best channel based on customer preference and availability
+              preferred = profile.get('preferred_channel')
+              channels_seen = profile.get('channels_seen', [])
+              delivery_channel = preferred or rule['preferred_channels'][0]
+
+              action = {
+                  'action_id': str(uuid.uuid4()),
+                  'customer_id': state_change_event['customer_id'],
+                  'action_type': rule['action_type'],
+                  'urgency': rule['urgency'],
+                  'delivery_channel': delivery_channel,
+                  'message_template': rule['message_template'],
+                  'delay_seconds': rule['delay_seconds'],
+                  'status': 'pending',
+                  'created_at': int(time.time() * 1000),
+                  'journey_type': journey_type,
+                  'journey_state': current_state,
+                  'ttl': int(time.time()) + (30 * 86400)  # 30-day TTL
+              }
+
+              return action
+
+          def handler(event, context):
+              actions = []
+
+              for record in event['Records']:
+                  payload = json.loads(
+                      base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  )
+
+                  customer_id = payload.get('customer_id')
+                  if not customer_id:
+                      continue
+
+                  # Fetch customer profile for personalization
+                  profile_resp = profiles_table.get_item(Key={'customer_id': customer_id})
+                  profile = profile_resp.get('Item', {})
+
+                  action = evaluate_nba(payload, profile)
+                  if not action:
+                      continue
+
+                  # Write action to DynamoDB
+                  timestamp_action_id = f"{action['created_at']}#{action['action_id']}"
+                  action['timestamp_action_id'] = timestamp_action_id
+                  nba_table.put_item(Item=action)
+
+                  # Emit to EventBridge for downstream processing
+                  events_client.put_events(Entries=[{
+                      'Source': 'cx-intelligence.nba',
+                      'DetailType': f'NBAAction.{action["urgency"]}',
+                      'Detail': json.dumps(action),
+                      'EventBusName': EVENT_BUS
+                  }])
+
+                  actions.append(action)
+
+              return {'statusCode': 200, 'actions_created': len(actions)}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis -> NBA Evaluator event source mapping
+  NBAEvaluatorEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref NBAEventsStreamArn
+      FunctionName: !Ref NBAEvaluatorFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: !If [IsProd, 100, 10]
+      MaximumBatchingWindowInSeconds: !If [IsProd, 5, 30]
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ClassifierFunctionArn:
+    Description: ARN of the classifier Lambda function
+    Value: !GetAtt ClassifierFunction.Arn
+  ClassifierFunctionName:
+    Description: Name of the classifier Lambda function
+    Value: !Ref ClassifierFunction
+
+  IdentityResolverFunctionArn:
+    Description: ARN of the identity resolver Lambda function
+    Value: !GetAtt IdentityResolverFunction.Arn
+  IdentityResolverFunctionName:
+    Description: Name of the identity resolver Lambda function
+    Value: !Ref IdentityResolverFunction
+
+  JourneyProcessorFunctionArn:
+    Description: ARN of the journey processor Lambda function
+    Value: !GetAtt JourneyProcessorFunction.Arn
+  JourneyProcessorFunctionName:
+    Description: Name of the journey processor Lambda function
+    Value: !Ref JourneyProcessorFunction
+
+  NBAEvaluatorFunctionArn:
+    Description: ARN of the NBA evaluator Lambda function
+    Value: !GetAtt NBAEvaluatorFunction.Arn
+  NBAEvaluatorFunctionName:
+    Description: Name of the NBA evaluator Lambda function
+    Value: !Ref NBAEvaluatorFunction
+
+  ClassificationLayerArn:
+    Description: ARN of the shared classification Lambda layer
+    Value: !Ref ClassificationLayer

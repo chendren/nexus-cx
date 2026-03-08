@@ -1,0 +1,9 @@
+{
+  "name": "nexus-cx",
+  "version": "1.0.0",
+  "description": "Nexus CX Intelligence Platform — skills, agents, and commands for CX operations",
+  "author": "Chad Hendren",
+  "skills": "skills/",
+  "agents": "agents/",
+  "commands": "commands/"
+}

@@ -1,0 +1,2535 @@
+<!--
+  Nexus CX Intelligence Platform - Real-Time Operations Dashboard
+
+  Single-page application providing live operational visibility into the CX platform.
+  Connects via WebSocket for real-time event streaming and periodic REST polling for
+  customer profiles and dashboard state.
+
+  Panels:
+    1. Event Simulator      - Send rich interaction payloads with customer metadata
+    2. CX Operations        - Live KPI cards with SVG sparkline trend charts
+    3. Live Command Center  - Streaming event feed + LLM enrichment insights
+    4. Journey Intelligence - Distributions, triggers, paths, stuck/at-risk journeys
+    5. Customer Explorer    - Unified profile table with detail pane
+
+  Features:
+    - Health status polling (GET /api/health/ready) every 30s
+    - Circuit breaker badge reflecting Ollama availability
+    - SLA breach alert banner with auto-dismiss
+    - CSV/JSON export for metrics and events
+    - Responsive grid layout with dark theme
+
+  No build step required. Pure HTML/CSS/JS. No external dependencies.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus CX Intelligence Platform</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+:root {
+  --bg: #07111f;
+  --panel: #0d1a2b;
+  --panel-elevated: #112239;
+  --panel-soft: #152945;
+  --line: rgba(120, 192, 255, 0.18);
+  --line-strong: rgba(120, 192, 255, 0.34);
+  --text: #e6f0ff;
+  --text-dim: #8fa7c6;
+  --text-muted: #607592;
+  --primary: #57c7ff;
+  --primary-soft: rgba(87, 199, 255, 0.14);
+  --success: #33d17a;
+  --success-soft: rgba(51, 209, 122, 0.14);
+  --warning: #ffb020;
+  --warning-soft: rgba(255, 176, 32, 0.14);
+  --danger: #ff6b81;
+  --danger-soft: rgba(255, 107, 129, 0.14);
+  --info: #8d7dff;
+  --info-soft: rgba(141, 125, 255, 0.14);
+  --voice: #ff7d7d;
+  --chat: #44d0c8;
+  --web: #5fb4ff;
+  --mobile: #7ad3a8;
+  --email: #ffd57e;
+  --sms: #d9e0ea;
+  --whatsapp: #28d46b;
+  --billing: #5fb4ff;
+  --technical_support: #ffb020;
+  --account: #33d17a;
+  --sales: #9c88ff;
+  --general: #9aa7b9;
+  --radius: 16px;
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+body {
+  background:
+    radial-gradient(circle at top left, rgba(87, 199, 255, 0.08), transparent 30%),
+    radial-gradient(circle at top right, rgba(141, 125, 255, 0.08), transparent 26%),
+    var(--bg);
+  color: var(--text);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  height: 100vh;
+  overflow: hidden;
+}
+a { color: inherit; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+.skip-link {
+  position: absolute;
+  left: 12px;
+  top: -48px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--primary);
+  color: #05101d;
+  font-weight: 700;
+  z-index: 1000;
+}
+.skip-link:focus { top: 12px; }
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(7, 17, 31, 0.94);
+  backdrop-filter: blur(18px);
+}
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.brand-title {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--primary);
+}
+.brand-subtitle {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.status-chip,
+.summary-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(17, 34, 57, 0.72);
+  color: var(--text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 4px rgba(255, 107, 129, 0.12);
+}
+.status-dot.connected {
+  background: var(--success);
+  box-shadow: 0 0 0 4px rgba(51, 209, 122, 0.14);
+}
+.summary-chip strong { color: var(--text); }
+.app-shell {
+  display: grid;
+  grid-template-columns: 340px minmax(0, 1fr) 390px;
+  grid-template-rows: minmax(0, 1fr) 320px;
+  grid-template-areas:
+    "sidebar center intel"
+    "sidebar customers customers";
+  gap: 14px;
+  padding: 14px;
+  height: calc(100vh - 89px);
+}
+.panel,
+.center-column {
+  min-height: 0;
+  min-width: 0;
+}
+.panel {
+  background: linear-gradient(180deg, rgba(17, 34, 57, 0.96), rgba(11, 25, 42, 0.96));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.panel-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.panel-title {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--primary);
+}
+.panel-subtitle {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.panel-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  border: 1px solid rgba(87, 199, 255, 0.28);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.panel-body {
+  padding: 16px 18px;
+  overflow: auto;
+  height: calc(100% - 72px);
+}
+.sidebar-panel { grid-area: sidebar; }
+.center-column {
+  grid-area: center;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+}
+.intelligence-panel { grid-area: intel; }
+.customer-panel { grid-area: customers; }
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.form-group.full { grid-column: 1 / -1; }
+.label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.input,
+.select,
+.textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(7, 17, 31, 0.84);
+  color: var(--text);
+  padding: 11px 12px;
+}
+.textarea {
+  min-height: 94px;
+  resize: vertical;
+}
+.form-help {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.button-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+.btn {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 11px 14px;
+  background: rgba(21, 41, 69, 0.92);
+  color: var(--text);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.btn-primary {
+  flex: 1;
+  background: linear-gradient(135deg, rgba(87, 199, 255, 0.24), rgba(87, 199, 255, 0.12));
+  color: var(--primary);
+  border-color: rgba(87, 199, 255, 0.42);
+}
+.btn-secondary {
+  background: rgba(141, 125, 255, 0.14);
+  border-color: rgba(141, 125, 255, 0.28);
+  color: #c9c0ff;
+}
+.btn:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.send-status {
+  min-height: 20px;
+  margin-top: 10px;
+  color: var(--success);
+  font-size: 12px;
+}
+.send-status.error { color: var(--danger); }
+.section-heading {
+  margin: 18px 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.scenario-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.scenario-btn {
+  text-align: left;
+  min-height: 72px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(21, 41, 69, 0.78);
+  color: var(--text);
+}
+.scenario-btn.wide { grid-column: 1 / -1; }
+.scenario-btn strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+.scenario-btn span {
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+.kpi-card {
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(21, 41, 69, 0.84);
+}
+.kpi-card.wide { grid-column: span 2; }
+.kpi-value {
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.03em;
+}
+.kpi-label {
+  margin-top: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.kpi-meta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.feed-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+  gap: 14px;
+  height: 100%;
+}
+.feed-column {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.feed-title {
+  margin: 0 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 160px;
+  padding: 18px;
+  border: 1px dashed var(--line);
+  border-radius: 16px;
+  color: var(--text-dim);
+  text-align: center;
+  background: rgba(7, 17, 31, 0.44);
+}
+.event-card,
+.insight-card,
+.signal-card,
+.detail-card,
+.path-card,
+.list-card,
+.stuck-card {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(21, 41, 69, 0.74);
+  padding: 14px;
+}
+.event-card { display: flex; flex-direction: column; gap: 10px; }
+.card-top,
+.card-row,
+.inline-list,
+.customer-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.card-top {
+  justify-content: space-between;
+  gap: 12px;
+}
+.left-inline,
+.right-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.channel-badge,
+.pill,
+.domain-pill,
+.queue-pill,
+.alias-chip,
+.channel-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+.channel-badge { color: #07111f; }
+.channel-badge.voice { background: var(--voice); }
+.channel-badge.chat { background: var(--chat); }
+.channel-badge.web { background: var(--web); }
+.channel-badge.mobile { background: var(--mobile); }
+.channel-badge.email { background: var(--email); }
+.channel-badge.sms { background: var(--sms); }
+.channel-badge.whatsapp { background: var(--whatsapp); }
+.pill { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.08); color: var(--text-dim); }
+.pill.success { background: var(--success-soft); border-color: rgba(51, 209, 122, 0.32); color: var(--success); }
+.pill.warning { background: var(--warning-soft); border-color: rgba(255, 176, 32, 0.28); color: var(--warning); }
+.pill.danger { background: var(--danger-soft); border-color: rgba(255, 107, 129, 0.28); color: var(--danger); }
+.pill.info { background: var(--info-soft); border-color: rgba(141, 125, 255, 0.28); color: #c9c0ff; }
+.domain-pill.billing { color: var(--billing); border-color: rgba(95, 180, 255, 0.34); background: rgba(95, 180, 255, 0.12); }
+.domain-pill.technical_support { color: var(--technical_support); border-color: rgba(255, 176, 32, 0.28); background: rgba(255, 176, 32, 0.12); }
+.domain-pill.account { color: var(--account); border-color: rgba(51, 209, 122, 0.28); background: rgba(51, 209, 122, 0.12); }
+.domain-pill.sales { color: var(--sales); border-color: rgba(156, 136, 255, 0.28); background: rgba(156, 136, 255, 0.12); }
+.domain-pill.general { color: var(--general); border-color: rgba(154, 167, 185, 0.24); background: rgba(154, 167, 185, 0.12); }
+.queue-pill { color: var(--primary); border-color: rgba(87, 199, 255, 0.26); background: rgba(87, 199, 255, 0.1); }
+.alias-chip,
+.channel-chip { color: var(--text-dim); background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); }
+.event-message,
+.insight-text,
+.detail-copy {
+  color: var(--text);
+  line-height: 1.55;
+}
+.muted,
+.timestamp,
+.metric-copy,
+.table-subcopy {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.timestamp { white-space: nowrap; }
+.event-header-label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.nba-list,
+.path-list,
+.simple-list,
+.detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.nba-item,
+.path-item,
+.simple-item,
+.detail-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(7, 17, 31, 0.42);
+}
+.simple-item span:last-child,
+.path-item span:last-child,
+.nba-item span:last-child {
+  color: var(--text);
+  font-weight: 700;
+}
+.grid-2,
+.grid-3 {
+  display: grid;
+  gap: 12px;
+}
+.grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mini-stat {
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(21, 41, 69, 0.8);
+}
+.mini-stat-value {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--text);
+}
+.mini-stat-label {
+  margin-top: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.dist-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.dist-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) 38px;
+  gap: 8px;
+  align-items: center;
+}
+.dist-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.dist-track {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.dist-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+.dist-fill.billing { background: linear-gradient(90deg, rgba(95,180,255,1), rgba(95,180,255,0.45)); }
+.dist-fill.technical_support { background: linear-gradient(90deg, rgba(255,176,32,1), rgba(255,176,32,0.45)); }
+.dist-fill.account { background: linear-gradient(90deg, rgba(51,209,122,1), rgba(51,209,122,0.45)); }
+.dist-fill.sales { background: linear-gradient(90deg, rgba(156,136,255,1), rgba(156,136,255,0.45)); }
+.dist-fill.general { background: linear-gradient(90deg, rgba(154,167,185,1), rgba(154,167,185,0.45)); }
+.dist-fill.positive,
+.dist-fill.compliant,
+.dist-fill.low { background: linear-gradient(90deg, rgba(51,209,122,1), rgba(51,209,122,0.45)); }
+.dist-fill.neutral,
+.dist-fill.medium,
+.dist-fill.at_risk { background: linear-gradient(90deg, rgba(87,199,255,1), rgba(87,199,255,0.45)); }
+.dist-fill.frustrated,
+.dist-fill.high,
+.dist-fill.negative { background: linear-gradient(90deg, rgba(255,176,32,1), rgba(255,176,32,0.45)); }
+.dist-fill.angry,
+.dist-fill.critical,
+.dist-fill.breached { background: linear-gradient(90deg, rgba(255,107,129,1), rgba(255,107,129,0.45)); }
+.dist-count { text-align: right; font-size: 12px; color: var(--text); }
+.intelligence-stack { display: flex; flex-direction: column; gap: 14px; }
+.stack-section { display: flex; flex-direction: column; gap: 10px; }
+.stack-title {
+  margin: 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.stuck-list,
+.horizontal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.stuck-card strong,
+.detail-heading,
+.list-card strong,
+.path-card strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+.customer-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) 360px;
+  gap: 14px;
+  height: 100%;
+}
+.table-wrap {
+  min-height: 0;
+  overflow: auto;
+}
+.customer-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.customer-table th,
+.customer-table td {
+  padding: 12px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  text-align: left;
+  font-size: 13px;
+  vertical-align: top;
+}
+.customer-table th {
+  position: sticky;
+  top: 0;
+  background: rgba(13, 26, 43, 0.96);
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.customer-table tr:hover { background: rgba(255, 255, 255, 0.025); }
+.customer-table tr.selected { background: rgba(87, 199, 255, 0.08); }
+.customer-link {
+  border: none;
+  background: transparent;
+  color: var(--primary);
+  font-weight: 700;
+  padding: 0;
+}
+.detail-pane {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.detail-hero {
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(21, 41, 69, 0.84);
+}
+.detail-title {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+.detail-subtitle { color: var(--text-dim); font-size: 13px; }
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.detail-metric {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(7, 17, 31, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.detail-metric strong {
+  display: block;
+  font-size: 20px;
+  margin-bottom: 4px;
+}
+.detail-metric span {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.inline-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.footer-note {
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* Sparkline */
+.kpi-sparkline {
+  margin-top: 8px;
+  height: 28px;
+  overflow: visible;
+}
+.kpi-sparkline svg {
+  width: 100%;
+  height: 28px;
+  display: block;
+}
+.kpi-sparkline .spark-line {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.kpi-sparkline .spark-area {
+  fill: var(--primary-soft);
+}
+/* SLA alert banner */
+.sla-alert-banner {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  background: linear-gradient(90deg, rgba(255,107,129,0.18), rgba(255,107,129,0.06));
+  border: 1px solid rgba(255, 107, 129, 0.32);
+  border-radius: 12px;
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 600;
+  animation: sla-flash 1.2s ease-in-out 3;
+}
+.sla-alert-banner.visible { display: flex; }
+@keyframes sla-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.sla-alert-banner .sla-alert-dismiss {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--danger);
+  font-size: 16px;
+  padding: 0 4px;
+}
+/* Export buttons */
+.export-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.btn-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(21, 41, 69, 0.7);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.btn-export:hover { border-color: var(--primary); color: var(--primary); }
+/* Latency panel */
+.latency-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.latency-stat {
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(7, 17, 31, 0.42);
+  text-align: center;
+}
+.latency-stat-value {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--primary);
+}
+.latency-stat-label {
+  margin-top: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+/* Circuit breaker badge */
+.circuit-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.circuit-badge.closed { background: var(--success-soft); color: var(--success); border: 1px solid rgba(51,209,122,0.28); }
+.circuit-badge.open { background: var(--danger-soft); color: var(--danger); border: 1px solid rgba(255,107,129,0.28); }
+.circuit-badge.half_open { background: var(--warning-soft); color: var(--warning); border: 1px solid rgba(255,176,32,0.28); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(120, 192, 255, 0.2); border-radius: 999px; }
+::-webkit-scrollbar-track { background: transparent; }
+@media (max-width: 1500px) {
+  .app-shell {
+    grid-template-columns: 320px minmax(0, 1fr) 340px;
+  }
+  .kpi-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 1240px) {
+  body { overflow: auto; }
+  .app-shell {
+    height: auto;
+    min-height: calc(100vh - 89px);
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+    grid-template-areas:
+      "sidebar"
+      "center"
+      "intel"
+      "customers";
+  }
+  .customer-layout,
+  .feed-layout { grid-template-columns: 1fr; }
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+<a href="#mainContent" class="skip-link">Skip to dashboard</a>
+<header class="topbar">
+  <div class="brand">
+    <h1 class="brand-title">Nexus CX Intelligence Platform</h1>
+    <div class="brand-subtitle">Unified identity, routing intelligence, journey risk, and live next-best-action operations.</div>
+  </div>
+  <div class="topbar-meta">
+    <div class="status-chip" aria-live="polite">
+      <span class="status-dot" id="connectionDot"></span>
+      <strong id="connectionLabel">Disconnected</strong>
+    </div>
+    <div class="summary-chip"><span>Last refresh</span><strong id="lastRefreshLabel">Pending</strong></div>
+    <div class="summary-chip"><span>Active customers</span><strong id="topActiveCustomers">0</strong></div>
+    <div class="summary-chip"><span>Deflection rate</span><strong id="topDeflectionRate">0%</strong></div>
+    <div class="summary-chip"><span>Stuck journeys</span><strong id="topStuckJourneys">0</strong></div>
+    <div class="summary-chip" title="System health"><span>System</span><strong id="healthStatus" style="display:flex;align-items:center;gap:4px"><span id="healthDot" style="width:8px;height:8px;border-radius:50%;background:var(--text-muted);display:inline-block"></span>Checking</strong></div>
+    <span class="circuit-badge closed" id="circuitBadge" title="Ollama circuit breaker">CB: Closed</span>
+  </div>
+</header>
+<main id="mainContent" class="app-shell">
+  <section class="panel sidebar-panel" aria-labelledby="simulatorTitle">
+    <div class="panel-header">
+      <div class="panel-title-wrap">
+        <h2 class="panel-title" id="simulatorTitle">Event Simulator</h2>
+        <div class="panel-subtitle">Send realistic omnichannel interactions with metadata and routing context.</div>
+      </div>
+      <div class="panel-badge" id="sentCount">0 sent</div>
+    </div>
+    <div class="panel-body">
+      <form id="simForm">
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="label" for="simChannel">Channel</label>
+            <select id="simChannel" class="select">
+              <option value="voice">Voice</option>
+              <option value="chat">Chat</option>
+              <option value="web" selected>Web</option>
+              <option value="mobile">Mobile</option>
+              <option value="email">Email</option>
+              <option value="sms">SMS</option>
+              <option value="whatsapp">WhatsApp</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="label" for="simTier">Customer tier</label>
+            <select id="simTier" class="select">
+              <option value="standard">Standard</option>
+              <option value="gold">Gold</option>
+              <option value="premium">Premium</option>
+              <option value="enterprise">Enterprise</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="label" for="simCustomerId">Customer ID</label>
+            <input id="simCustomerId" class="input" placeholder="cust-12345">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simSessionId">Session ID</label>
+            <input id="simSessionId" class="input" placeholder="sess-12345">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simName">Name</label>
+            <input id="simName" class="input" placeholder="Jordan Lee">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simEmail">Email</label>
+            <input id="simEmail" class="input" placeholder="customer@example.com">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simPhone">Phone</label>
+            <input id="simPhone" class="input" placeholder="5550104000">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simSkills">Required skills</label>
+            <input id="simSkills" class="input" placeholder="billing, retention">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simQueueWait">Queue wait minutes</label>
+            <input id="simQueueWait" class="input" type="number" min="0" max="60" value="0">
+          </div>
+          <div class="form-group">
+            <label class="label" for="simTouchpoint">Touchpoint</label>
+            <input id="simTouchpoint" class="input" placeholder="billing-portal">
+          </div>
+          <div class="form-group full">
+            <label class="label" for="simContent">Interaction content</label>
+            <textarea id="simContent" class="textarea" placeholder="Describe the customer interaction or request..."></textarea>
+            <div class="form-help">Use quick scenarios below to generate cross-channel, churn, identity stitching, and self-service flows.</div>
+          </div>
+        </div>
+        <div class="button-row">
+          <button type="submit" class="btn btn-primary">Send event</button>
+          <button type="button" class="btn btn-secondary" id="generateTrafficBtn">Generate 20 events</button>
+        </div>
+        <div class="send-status" id="sendStatus" aria-live="polite"></div>
+      </form>
+
+      <h3 class="section-heading">Quick scenarios</h3>
+      <div class="scenario-grid" id="scenarioGrid"></div>
+
+      <div class="footer-note">
+        The simulator sends metadata for customer tier, identifiers, queue wait, and required skills so the UI can demonstrate routing, deflection, identity stitching, and journey risk in one place.
+      </div>
+    </div>
+  </section>
+
+  <section class="center-column">
+    <section class="panel" aria-labelledby="kpiTitle">
+      <div class="panel-header">
+        <div class="panel-title-wrap">
+          <h2 class="panel-title" id="kpiTitle">CX Operations Snapshot</h2>
+          <div class="panel-subtitle">Live KPIs, SLA health, contact value, and routing pressure.</div>
+        </div>
+        <div class="panel-badge" id="snapshotBadge">Awaiting data</div>
+      </div>
+      <div class="panel-body">
+        <div class="sla-alert-banner" id="slaAlertBanner" role="alert">
+          <span id="slaAlertText">SLA breach detected — immediate attention required</span>
+          <button class="sla-alert-dismiss" id="slaAlertDismiss" title="Dismiss">&times;</button>
+        </div>
+        <div class="kpi-grid">
+          <div class="kpi-card"><div class="kpi-value" id="kpiTotalContacts">0</div><div class="kpi-label">Total contacts</div><div class="kpi-meta">Unified interactions processed</div><div class="kpi-sparkline" id="sparkContacts"></div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiEventsPerMinute">0</div><div class="kpi-label">Events / minute</div><div class="kpi-meta">Live event velocity</div><div class="kpi-sparkline" id="sparkEvents"></div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiActiveJourneys">0</div><div class="kpi-label">Active journeys</div><div class="kpi-meta">In-flight customer work</div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiStuckJourneys">0</div><div class="kpi-label">At-risk / stuck</div><div class="kpi-meta">Needs intervention now</div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiHighPriority">0</div><div class="kpi-label">High-priority contacts</div><div class="kpi-meta">Priority >= 8</div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiSlaCompliance">0%</div><div class="kpi-label">SLA compliance</div><div class="kpi-meta">Compliant contacts</div><div class="kpi-sparkline" id="sparkSla"></div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiAvgWait">0m</div><div class="kpi-label">Average wait</div><div class="kpi-meta">Estimated queue delay</div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiDeflectionRate">0%</div><div class="kpi-label">Deflection rate</div><div class="kpi-meta">Self-service opportunities</div></div>
+          <div class="kpi-card"><div class="kpi-value" id="kpiContactValue">0</div><div class="kpi-label">Average contact value</div><div class="kpi-meta">Priority-weighted value</div></div>
+          <div class="kpi-card wide"><div class="kpi-value" id="kpiActiveCustomers">0</div><div class="kpi-label">Recent active customers</div><div class="kpi-meta">Customers seen across recent interactions</div></div>
+        </div>
+        <div class="export-row">
+          <button class="btn-export" id="exportMetricsCsv" type="button">Export metrics CSV</button>
+          <button class="btn-export" id="exportMetricsJson" type="button">Export metrics JSON</button>
+          <button class="btn-export" id="exportEventsCsv" type="button">Export events CSV</button>
+          <button class="btn-export" id="exportEventsJson" type="button">Export events JSON</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="streamTitle">
+      <div class="panel-header">
+        <div class="panel-title-wrap">
+          <h2 class="panel-title" id="streamTitle">Live Command Center</h2>
+          <div class="panel-subtitle">Streaming events, action recommendations, routing signals, and enrichment insights.</div>
+        </div>
+        <div class="panel-badge"><span id="eventCount">0</span> events / <span id="insightCount">0</span> insights</div>
+      </div>
+      <div class="panel-body">
+        <div class="feed-layout">
+          <div class="feed-column">
+            <h3 class="feed-title">Live events</h3>
+            <div class="feed-list" id="eventFeed" aria-live="polite"></div>
+          </div>
+          <div class="feed-column">
+            <h3 class="feed-title">Enrichment insights</h3>
+            <div class="feed-list" id="insightFeed" aria-live="polite"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section class="panel intelligence-panel" aria-labelledby="intelTitle">
+    <div class="panel-header">
+      <div class="panel-title-wrap">
+        <h2 class="panel-title" id="intelTitle">Journey and Routing Intelligence</h2>
+        <div class="panel-subtitle">Understand stuck flows, trigger patterns, sentiment pressure, and deflection opportunities.</div>
+      </div>
+      <div class="panel-badge" id="journeyBadge">0 handoffs</div>
+    </div>
+    <div class="panel-body">
+      <div class="intelligence-stack">
+        <section class="stack-section">
+          <h3 class="stack-title">Pipeline performance</h3>
+          <div class="latency-grid">
+            <div class="latency-stat"><div class="latency-stat-value" id="latencyIdentity">--</div><div class="latency-stat-label">Identity</div></div>
+            <div class="latency-stat"><div class="latency-stat-value" id="latencyTotal">--</div><div class="latency-stat-label">Total</div></div>
+            <div class="latency-stat"><div class="latency-stat-value" id="latencyCount">0</div><div class="latency-stat-label">Processed</div></div>
+          </div>
+        </section>
+
+        <section class="stack-section">
+          <h3 class="stack-title">Journey summary</h3>
+          <div class="grid-2">
+            <div class="mini-stat"><div class="mini-stat-value" id="journeySummaryActive">0</div><div class="mini-stat-label">Active</div></div>
+            <div class="mini-stat"><div class="mini-stat-value" id="journeySummaryCompleted">0</div><div class="mini-stat-label">Completed</div></div>
+            <div class="mini-stat"><div class="mini-stat-value" id="journeySummaryStuck">0</div><div class="mini-stat-label">At-risk / stuck</div></div>
+            <div class="mini-stat"><div class="mini-stat-value" id="journeySummaryHandoffs">0</div><div class="mini-stat-label">Cross-channel handoffs</div></div>
+          </div>
+        </section>
+
+        <section class="stack-section">
+          <h3 class="stack-title">Distributions</h3>
+          <div class="signal-card">
+            <strong>Intent domains</strong>
+            <div class="dist-group" id="domainDist"></div>
+          </div>
+          <div class="signal-card">
+            <strong>Sentiment mix</strong>
+            <div class="dist-group" id="sentimentDist"></div>
+          </div>
+          <div class="signal-card">
+            <strong>SLA status</strong>
+            <div class="dist-group" id="slaDist"></div>
+          </div>
+        </section>
+
+        <section class="stack-section">
+          <h3 class="stack-title">Operational leaders</h3>
+          <div class="list-card">
+            <strong>Top intents</strong>
+            <div class="simple-list" id="topIntentsList"></div>
+          </div>
+          <div class="list-card">
+            <strong>Top channels</strong>
+            <div class="simple-list" id="topChannelsList"></div>
+          </div>
+          <div class="list-card">
+            <strong>Common journey paths</strong>
+            <div class="path-list" id="commonPathsList"></div>
+          </div>
+          <div class="list-card">
+            <strong>Top triggers</strong>
+            <div class="simple-list" id="topTriggersList"></div>
+          </div>
+        </section>
+
+        <section class="stack-section">
+          <h3 class="stack-title">Journey risk</h3>
+          <div class="stuck-list" id="stuckJourneysList"></div>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel customer-panel" aria-labelledby="customerTitle">
+    <div class="panel-header">
+      <div class="panel-title-wrap">
+        <h2 class="panel-title" id="customerTitle">Customer Explorer</h2>
+        <div class="panel-subtitle">Browse unified profiles, stitched aliases, recent sentiment, and per-customer journey intelligence.</div>
+      </div>
+      <div class="panel-badge" id="customerCount">0 customers</div>
+    </div>
+    <div class="panel-body">
+      <div class="customer-layout">
+        <div class="table-wrap">
+          <table class="customer-table">
+            <thead>
+              <tr>
+                <th>Customer</th>
+                <th>Tier</th>
+                <th>Channels</th>
+                <th>Interactions</th>
+                <th>Journeys</th>
+                <th>Sentiment</th>
+                <th>Last seen</th>
+              </tr>
+            </thead>
+            <tbody id="customerTableBody"></tbody>
+          </table>
+        </div>
+        <aside class="detail-pane" id="customerDetailPane" aria-live="polite"></aside>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+var state = {
+  ws: null,
+  reconnectTimer: null,
+  dashboard: null,
+  customers: [],
+  customerDetails: {},
+  selectedCustomerId: '',
+  events: [],
+  insights: [],
+  sentCount: 0,
+  connected: false,
+  lastRefreshAt: '',
+  pollingTimer: null,
+  customerTimer: null
+};
+
+var API_BASE = window.location.origin;
+var WS_URL = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host;
+var CHANNEL_LABELS = {
+  voice: 'VOICE',
+  chat: 'CHAT',
+  web: 'WEB',
+  mobile: 'MOBILE',
+  email: 'EMAIL',
+  sms: 'SMS',
+  whatsapp: 'WHATSAPP'
+};
+var DOMAIN_LABELS = {
+  billing: 'Billing',
+  technical_support: 'Tech support',
+  account: 'Account',
+  sales: 'Sales',
+  general: 'General'
+};
+var DEFAULT_EMPTY_TEXT = 'No data yet';
+var SCENARIOS = [
+  {
+    id: 'billing-escalation',
+    label: 'Billing escalation',
+    description: 'High urgency billing dispute with premium routing.',
+    wide: false,
+    events: [
+      {
+        channel: 'voice',
+        customerId: 'demo-billing-001',
+        tier: 'premium',
+        name: 'Jordan Price',
+        email: 'jordan.price@example.com',
+        phone: '5550101111',
+        requiredSkills: 'billing, retention',
+        queueWaitMinutes: 7,
+        touchpoint: 'ivr-billing',
+        content: 'I was charged twice this month and I need a refund right now. This is unacceptable.'
+      },
+      {
+        channel: 'chat',
+        customerId: 'demo-billing-001',
+        tier: 'premium',
+        name: 'Jordan Price',
+        email: 'jordan.price@example.com',
+        phone: '5550101111',
+        requiredSkills: 'billing',
+        queueWaitMinutes: 3,
+        touchpoint: 'billing-chat',
+        content: 'Following up on my billing dispute because I still have not heard back.'
+      }
+    ]
+  },
+  {
+    id: 'password-deflection',
+    label: 'Password deflection',
+    description: 'Shows self-service routing and deflection outcomes.',
+    wide: false,
+    events: [
+      {
+        channel: 'web',
+        customerId: 'demo-selfserve-002',
+        tier: 'standard',
+        name: 'Avery Chen',
+        email: 'avery.chen@example.com',
+        phone: '5550102222',
+        requiredSkills: 'account',
+        queueWaitMinutes: 0,
+        touchpoint: 'login-screen',
+        content: 'I need to reset my password so I can sign back in to my account.'
+      }
+    ]
+  },
+  {
+    id: 'cross-channel-upgrade',
+    label: 'Cross-channel upgrade',
+    description: 'Upgrade research that moves from web to chat to voice.',
+    wide: true,
+    events: [
+      {
+        channel: 'web',
+        customerId: 'demo-upgrade-003',
+        tier: 'gold',
+        name: 'Casey Morgan',
+        email: 'casey.morgan@example.com',
+        phone: '5550103333',
+        requiredSkills: 'sales',
+        queueWaitMinutes: 0,
+        touchpoint: 'pricing-page',
+        content: 'I am comparing premium plans for my business and want to understand enterprise features.'
+      },
+      {
+        channel: 'chat',
+        customerId: 'demo-upgrade-003',
+        tier: 'gold',
+        name: 'Casey Morgan',
+        email: 'casey.morgan@example.com',
+        phone: '5550103333',
+        requiredSkills: 'sales',
+        queueWaitMinutes: 2,
+        touchpoint: 'sales-chat',
+        content: 'Can you walk me through the enterprise pricing and what support is included?'
+      },
+      {
+        channel: 'voice',
+        customerId: 'demo-upgrade-003',
+        tier: 'gold',
+        name: 'Casey Morgan',
+        email: 'casey.morgan@example.com',
+        phone: '5550103333',
+        requiredSkills: 'sales, onboarding',
+        queueWaitMinutes: 4,
+        touchpoint: 'sales-voice',
+        content: 'I am ready to finalize the upgrade and want help setting up the new account configuration.'
+      }
+    ]
+  },
+  {
+    id: 'identity-stitch',
+    label: 'Identity stitching',
+    description: 'Uses different customer IDs with shared identifiers to unify profiles.',
+    wide: true,
+    events: [
+      {
+        channel: 'mobile',
+        customerId: 'crm-7781',
+        tier: 'premium',
+        name: 'Taylor Rivera',
+        email: 'taylor.rivera@example.com',
+        phone: '5550104444',
+        requiredSkills: 'technical_support',
+        queueWaitMinutes: 1,
+        touchpoint: 'mobile-app',
+        content: 'The app keeps crashing every time I open billing settings.'
+      },
+      {
+        channel: 'chat',
+        customerId: 'legacy-991',
+        tier: 'premium',
+        name: 'Taylor Rivera',
+        email: 'taylor.rivera@example.com',
+        phone: '5550104444',
+        requiredSkills: 'technical_support, billing',
+        queueWaitMinutes: 2,
+        touchpoint: 'support-chat',
+        content: 'I am still seeing the same crash when I try to update payment preferences.'
+      }
+    ]
+  },
+  {
+    id: 'churn-save',
+    label: 'Churn save',
+    description: 'Cancellation intent that drives retention actions.',
+    wide: false,
+    events: [
+      {
+        channel: 'voice',
+        customerId: 'demo-churn-004',
+        tier: 'enterprise',
+        name: 'Morgan Shaw',
+        email: 'morgan.shaw@example.com',
+        phone: '5550105555',
+        requiredSkills: 'retention, billing',
+        queueWaitMinutes: 8,
+        touchpoint: 'retention-queue',
+        content: 'I want to cancel my account immediately because the service quality keeps getting worse.'
+      }
+    ]
+  },
+  {
+    id: 'positive-feedback',
+    label: 'Positive feedback',
+    description: 'Compliment flow to show satisfaction and survey follow-up.',
+    wide: false,
+    events: [
+      {
+        channel: 'chat',
+        customerId: 'demo-happy-005',
+        tier: 'standard',
+        name: 'Riley Harper',
+        email: 'riley.harper@example.com',
+        phone: '5550106666',
+        requiredSkills: 'general',
+        queueWaitMinutes: 0,
+        touchpoint: 'chat-support',
+        content: 'Your support agent was fantastic today and solved everything quickly. Thank you!'
+      }
+    ]
+  }
+];
+
+function el(tag, className, text) {
+  var node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function clearChildren(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function safeNumber(value) {
+  var parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function formatNumber(value) {
+  return String(Math.round(safeNumber(value) * 100) / 100);
+}
+
+function formatPercent(value) {
+  return formatNumber(value) + '%';
+}
+
+function formatMinutes(value) {
+  return formatNumber(value) + 'm';
+}
+
+function formatTime(iso) {
+  if (!iso) return '--:--:--';
+  var date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '--:--:--';
+  return date.toLocaleTimeString();
+}
+
+function formatTimeAgo(iso) {
+  if (!iso) return 'never';
+  var date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return 'never';
+  var diff = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (diff < 5) return 'just now';
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function titleCase(value) {
+  if (!value) return 'Unknown';
+  var parts = String(value).split('_');
+  var output = [];
+  for (var i = 0; i < parts.length; i++) {
+    var word = parts[i];
+    if (!word) continue;
+    output.push(word.charAt(0).toUpperCase() + word.slice(1));
+  }
+  return output.join(' ');
+}
+
+function shorten(value, max) {
+  var text = String(value || '');
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1) + '...';
+}
+
+function computeMoodClass(sentiment) {
+  if (sentiment === 'positive') return 'success';
+  if (sentiment === 'negative' || sentiment === 'frustrated') return 'warning';
+  if (sentiment === 'angry') return 'danger';
+  return 'info';
+}
+
+function computeUrgencyClass(urgency) {
+  if (urgency === 'critical') return 'danger';
+  if (urgency === 'high') return 'warning';
+  if (urgency === 'medium') return 'info';
+  return 'success';
+}
+
+function parseCommaList(value) {
+  var parts = String(value || '').split(',');
+  var result = [];
+  for (var i = 0; i < parts.length; i++) {
+    var trimmed = parts[i].trim();
+    if (trimmed && result.indexOf(trimmed) === -1) result.push(trimmed);
+  }
+  return result;
+}
+
+function generateId(prefix) {
+  var chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  var output = prefix + '-';
+  for (var i = 0; i < 6; i++) {
+    output += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return output;
+}
+
+function flattenCountMap(map, prefix, result) {
+  var output = result || {};
+  var base = prefix || '';
+  if (!map || typeof map !== 'object') return output;
+  var keys = Object.keys(map);
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var value = map[key];
+    var nextKey = base ? base + '.' + key : key;
+    if (typeof value === 'number') {
+      output[nextKey] = value;
+    } else if (value && typeof value === 'object') {
+      flattenCountMap(value, nextKey, output);
+    }
+  }
+  return output;
+}
+
+function sortedEntries(map) {
+  var entries = Object.entries(map || {});
+  entries.sort(function(a, b) { return b[1] - a[1]; });
+  return entries;
+}
+
+function lastSentiment(profile) {
+  var history = safeArray(profile && profile.sentiment_history);
+  if (!history.length) return 'unknown';
+  var item = history[history.length - 1];
+  return item.sentiment || 'unknown';
+}
+
+function getProfileChannels(profile) {
+  return safeArray(profile && (profile.channels_seen || profile.channels));
+}
+
+function getActiveJourneyCount(profile) {
+  var summary = profile && profile.journey_summary;
+  if (summary && typeof summary.active === 'number') return summary.active;
+  var journeys = safeArray(profile && profile.active_journeys);
+  return journeys.length;
+}
+
+function renderPill(text, variant) {
+  return el('span', 'pill ' + variant, text);
+}
+
+function fetchJson(url, options) {
+  return fetch(url, options).then(function(response) {
+    if (!response.ok) throw new Error('Request failed: ' + response.status);
+    return response.json();
+  });
+}
+
+function updateConnectionUI(connected) {
+  state.connected = connected;
+  var dot = byId('connectionDot');
+  var label = byId('connectionLabel');
+  dot.className = connected ? 'status-dot connected' : 'status-dot';
+  label.textContent = connected ? 'Connected' : 'Disconnected';
+  label.style.color = connected ? 'var(--success)' : 'var(--danger)';
+}
+
+function updateLastRefreshLabel() {
+  byId('lastRefreshLabel').textContent = state.lastRefreshAt ? formatTime(state.lastRefreshAt) : 'Pending';
+}
+
+function buildPayload(overrides) {
+  var tier = (overrides && overrides.tier) || byId('simTier').value;
+  var content = (overrides && overrides.content) || byId('simContent').value.trim();
+  var customerId = (overrides && overrides.customerId) || byId('simCustomerId').value.trim() || generateId('cust');
+  var sessionId = (overrides && overrides.sessionId) || byId('simSessionId').value.trim() || generateId('sess');
+  var name = (overrides && overrides.name) || byId('simName').value.trim();
+  var email = (overrides && overrides.email) || byId('simEmail').value.trim();
+  var phone = (overrides && overrides.phone) || byId('simPhone').value.trim();
+  var touchpoint = (overrides && overrides.touchpoint) || byId('simTouchpoint').value.trim();
+  var queueWaitMinutes = overrides && overrides.queueWaitMinutes !== undefined
+    ? overrides.queueWaitMinutes
+    : safeNumber(byId('simQueueWait').value);
+  var requiredSkills = overrides && overrides.requiredSkills !== undefined
+    ? parseCommaList(overrides.requiredSkills)
+    : parseCommaList(byId('simSkills').value);
+
+  return {
+    customerId: customerId,
+    sessionId: sessionId,
+    channel: (overrides && overrides.channel) || byId('simChannel').value,
+    eventType: 'interaction',
+    content: content,
+    metadata: {
+      name: name,
+      email: email,
+      phone: phone,
+      customer_tier: tier,
+      segment: tier === 'enterprise' ? 'enterprise' : tier === 'premium' ? 'high_value' : 'general'
+    },
+    context: {
+      touchpoint: touchpoint,
+      customerTier: tier,
+      queueWaitMinutes: queueWaitMinutes,
+      requiredSkills: requiredSkills
+    }
+  };
+}
+
+function setSimulatorValues(config) {
+  byId('simChannel').value = config.channel || 'web';
+  byId('simTier').value = config.tier || 'standard';
+  byId('simCustomerId').value = config.customerId || '';
+  byId('simSessionId').value = config.sessionId || '';
+  byId('simName').value = config.name || '';
+  byId('simEmail').value = config.email || '';
+  byId('simPhone').value = config.phone || '';
+  byId('simSkills').value = config.requiredSkills || '';
+  byId('simQueueWait').value = String(config.queueWaitMinutes || 0);
+  byId('simTouchpoint').value = config.touchpoint || '';
+  byId('simContent').value = config.content || '';
+}
+
+function showSendStatus(message, isError) {
+  var node = byId('sendStatus');
+  node.textContent = message;
+  node.className = isError ? 'send-status error' : 'send-status';
+}
+
+function postEvent(body) {
+  return fetchJson(API_BASE + '/api/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function(data) {
+    state.sentCount += 1;
+    byId('sentCount').textContent = state.sentCount + ' sent';
+    showSendStatus('Event sent for ' + body.customerId + ' on ' + body.channel + '.');
+    if (!state.selectedCustomerId) state.selectedCustomerId = body.customerId;
+    return data;
+  }).catch(function(error) {
+    showSendStatus(error.message, true);
+    throw error;
+  });
+}
+
+function sendSimulatorEvent() {
+  var payload = buildPayload();
+  if (!payload.content) {
+    showSendStatus('Please enter interaction content first.', true);
+    return Promise.resolve();
+  }
+  state.selectedCustomerId = payload.customerId;
+  return postEvent(payload).then(function() {
+    refreshAllData(true);
+  });
+}
+
+function runScenario(id) {
+  var scenario = null;
+  for (var i = 0; i < SCENARIOS.length; i++) {
+    if (SCENARIOS[i].id === id) scenario = SCENARIOS[i];
+  }
+  if (!scenario) return;
+  if (scenario.events.length) setSimulatorValues(scenario.events[0]);
+  showSendStatus('Running scenario: ' + scenario.label + ' ...');
+
+  var sequence = Promise.resolve();
+  var selectedCustomer = scenario.events[0].customerId;
+  for (var index = 0; index < scenario.events.length; index++) {
+    (function(stepIndex) {
+      sequence = sequence.then(function() {
+        if (stepIndex > 0) {
+          return new Promise(function(resolve) {
+            setTimeout(resolve, 280);
+          });
+        }
+      }).then(function() {
+        state.selectedCustomerId = selectedCustomer;
+        return postEvent(buildPayload(scenario.events[stepIndex]));
+      });
+    })(index);
+  }
+
+  sequence.then(function() {
+    showSendStatus('Scenario complete: ' + scenario.label + '.');
+    refreshAllData(true);
+  }).catch(function() {
+    showSendStatus('Scenario failed: ' + scenario.label + '.', true);
+  });
+}
+
+function generateTraffic() {
+  showSendStatus('Generating 20 mixed events ...');
+  var customerIds = ['fleet-a', 'fleet-b', 'fleet-c', 'fleet-d', 'fleet-e'];
+  var phrases = [
+    'I need to reset my password again.',
+    'I was charged twice and want a refund immediately.',
+    'The app keeps crashing on mobile and I am frustrated.',
+    'I want to cancel my account today.',
+    'Can you help me compare premium plans for my team?',
+    'Your service has been excellent, thank you.',
+    'My internet connection is down and I need help now.',
+    'I have a billing question about my latest statement.'
+  ];
+  var channels = ['voice', 'chat', 'web', 'mobile', 'email', 'sms', 'whatsapp'];
+  var tiers = ['standard', 'gold', 'premium'];
+  var promises = [];
+  for (var i = 0; i < 20; i++) {
+    (function(index) {
+      promises.push(new Promise(function(resolve) {
+        setTimeout(function() {
+          var payload = buildPayload({
+            channel: channels[index % channels.length],
+            customerId: customerIds[index % customerIds.length],
+            content: phrases[index % phrases.length],
+            tier: tiers[index % tiers.length],
+            name: 'Generated Customer ' + (index % customerIds.length + 1),
+            email: 'generated' + index + '@example.com',
+            phone: '5550107' + String(index).padStart(3, '0'),
+            requiredSkills: index % 2 === 0 ? 'billing, technical_support' : 'sales',
+            queueWaitMinutes: index % 6,
+            touchpoint: index % 2 === 0 ? 'self-service' : 'agent-assist'
+          });
+          postEvent(payload).finally(resolve);
+        }, index * 90);
+      }));
+    })(i);
+  }
+  Promise.all(promises).then(function() {
+    showSendStatus('Generated 20 mixed events.');
+    refreshAllData(true);
+  });
+}
+
+function connectWebSocket() {
+  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) return;
+  try {
+    state.ws = new WebSocket(WS_URL);
+  } catch (error) {
+    scheduleReconnect();
+    return;
+  }
+
+  state.ws.onopen = function() {
+    updateConnectionUI(true);
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+  };
+
+  state.ws.onmessage = function(event) {
+    try {
+      var payload = JSON.parse(event.data);
+      handleWebSocketMessage(payload);
+    } catch (error) {
+      addInsightCard({
+        type: 'parser_error',
+        timestamp: new Date().toISOString(),
+        message: 'Failed to parse WebSocket payload.'
+      });
+    }
+  };
+
+  state.ws.onclose = function() {
+    updateConnectionUI(false);
+    scheduleReconnect();
+  };
+
+  state.ws.onerror = function() {
+    updateConnectionUI(false);
+  };
+}
+
+function scheduleReconnect() {
+  if (state.reconnectTimer) return;
+  state.reconnectTimer = setTimeout(function() {
+    state.reconnectTimer = null;
+    connectWebSocket();
+  }, 3000);
+}
+
+function normalizeDashboardData(raw) {
+  if (!raw) return null;
+  if (raw.dashboardMetrics) {
+    var metrics = raw.dashboardMetrics;
+    if (raw.journeyIntelligence) metrics.journeyIntelligence = raw.journeyIntelligence;
+    if (raw.identityStats) metrics.identity = raw.identityStats;
+    if (raw.nbaStats) metrics.nba = raw.nbaStats;
+    return metrics;
+  }
+  return raw;
+}
+
+function handleWebSocketMessage(message) {
+  if (!message) return;
+  if (message.type === 'init') {
+    var normalized = normalizeDashboardData(message.data);
+    if (normalized) {
+      state.dashboard = mergeDashboard(state.dashboard, normalized);
+      renderDashboard();
+    }
+    return;
+  }
+  if (message.type === 'metrics') {
+    state.dashboard = mergeDashboard(state.dashboard, message.data);
+    renderDashboard();
+    return;
+  }
+  if (message.type === 'event') {
+    addEventCard(message.data);
+    return;
+  }
+  if (message.type === 'llm_enrichment') {
+    addInsightCard({
+      type: 'llm_enrichment',
+      timestamp: message.timestamp || message.data.timestamp,
+      data: message.data
+    });
+    return;
+  }
+  if (message.type === 'llm_enrichment_error') {
+    addInsightCard({
+      type: 'llm_error',
+      timestamp: message.timestamp || (message.data && message.data.timestamp),
+      data: message.data
+    });
+  }
+}
+
+function mergeDashboard(existing, incoming) {
+  var merged = {};
+  var sourceA = existing || {};
+  var sourceB = incoming || {};
+  var keys = Object.keys(sourceA).concat(Object.keys(sourceB));
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    if (sourceB[key] !== undefined) merged[key] = sourceB[key];
+    else merged[key] = sourceA[key];
+  }
+  return merged;
+}
+
+function addEventCard(data) {
+  if (!data) return;
+  state.events.unshift(data);
+  if (state.events.length > 60) state.events = state.events.slice(0, 60);
+  checkSlaBreaches(data);
+  renderEvents();
+  if (state.selectedCustomerId && (data.unified_customer_id === state.selectedCustomerId || data.customer_id === state.selectedCustomerId)) {
+    fetchSelectedCustomerDetail();
+  }
+}
+
+function addInsightCard(entry) {
+  state.insights.unshift(entry);
+  if (state.insights.length > 40) state.insights = state.insights.slice(0, 40);
+  renderInsights();
+}
+
+function refreshAllData(includeDetail) {
+  return Promise.all([
+    fetchJson(API_BASE + '/api/dashboard'),
+    fetchJson(API_BASE + '/api/customers')
+  ]).then(function(results) {
+    state.dashboard = normalizeDashboardData(results[0]);
+    state.customers = safeArray(results[1].profiles).slice().sort(function(a, b) {
+      return new Date(b.last_seen || 0).getTime() - new Date(a.last_seen || 0).getTime();
+    });
+    state.lastRefreshAt = new Date().toISOString();
+    renderDashboard();
+    renderCustomers();
+    updateLastRefreshLabel();
+
+    if (!state.selectedCustomerId && state.customers.length) {
+      state.selectedCustomerId = state.customers[0].customer_id;
+    }
+    if (includeDetail !== false) fetchSelectedCustomerDetail();
+  }).catch(function(error) {
+    showSendStatus('Failed to refresh dashboard: ' + error.message, true);
+  });
+}
+
+function fetchSelectedCustomerDetail() {
+  if (!state.selectedCustomerId) {
+    renderCustomerDetail(null);
+    return Promise.resolve();
+  }
+  return fetchJson(API_BASE + '/api/customers/' + encodeURIComponent(state.selectedCustomerId))
+    .then(function(detail) {
+      state.customerDetails[state.selectedCustomerId] = detail;
+      renderCustomerDetail(detail);
+    }).catch(function() {
+      renderCustomerDetail(null);
+    });
+}
+
+function renderDashboard() {
+  var dashboard = state.dashboard || {};
+  var kpis = dashboard.kpis || {};
+  var journeyIntel = dashboard.journeyIntelligence || {};
+  var operational = dashboard.operationalSummary || {};
+  var identity = dashboard.identity || {};
+
+  byId('snapshotBadge').textContent = state.lastRefreshAt ? 'Updated ' + formatTimeAgo(state.lastRefreshAt) : 'Awaiting data';
+  byId('kpiTotalContacts').textContent = formatNumber(kpis.total_contacts || 0);
+  byId('kpiEventsPerMinute').textContent = formatNumber((dashboard.windows && dashboard.windows.events_per_minute) || 0);
+  byId('kpiActiveJourneys').textContent = formatNumber(journeyIntel.activeJourneyCount || 0);
+  byId('kpiStuckJourneys').textContent = formatNumber(journeyIntel.stuckJourneyCount || 0);
+  byId('kpiHighPriority').textContent = formatNumber(kpis.high_priority_contacts || 0);
+  byId('kpiSlaCompliance').textContent = formatPercent(kpis.sla_compliance_rate || 0);
+  byId('kpiAvgWait').textContent = formatMinutes(kpis.avg_wait_time || 0);
+  byId('kpiDeflectionRate').textContent = formatPercent(kpis.deflection_rate || 0);
+  byId('kpiContactValue').textContent = formatNumber(kpis.avg_contact_value || 0);
+  byId('kpiActiveCustomers').textContent = formatNumber(operational.recent_active_customers || identity.totalProfiles || 0);
+
+  byId('topActiveCustomers').textContent = formatNumber(operational.recent_active_customers || 0);
+  byId('topDeflectionRate').textContent = formatPercent(kpis.deflection_rate || 0);
+  byId('topStuckJourneys').textContent = formatNumber(journeyIntel.stuckJourneyCount || 0);
+
+  byId('journeyBadge').textContent = formatNumber(journeyIntel.crossChannelHandoffs || 0) + ' handoffs';
+  byId('journeySummaryActive').textContent = formatNumber(journeyIntel.activeJourneyCount || 0);
+  byId('journeySummaryCompleted').textContent = formatNumber(journeyIntel.completedJourneyCount || 0);
+  byId('journeySummaryStuck').textContent = formatNumber(journeyIntel.stuckJourneyCount || 0);
+  byId('journeySummaryHandoffs').textContent = formatNumber(journeyIntel.crossChannelHandoffs || 0);
+
+  // Pipeline latency + circuit breaker
+  updateLatencyPanel(dashboard);
+  if (dashboard.circuitBreaker && dashboard.circuitBreaker.embed) {
+    updateCircuitBadge(dashboard.circuitBreaker.embed.state || dashboard.circuitBreaker.embed);
+  }
+
+  renderDistribution('domainDist', dashboard.classificationDistribution || {}, DOMAIN_LABELS);
+  renderDistribution('sentimentDist', kpis.sentiment_distribution || {}, {});
+  renderDistribution('slaDist', operational.sla_status || {}, {});
+
+  renderSimpleList('topChannelsList', sortedEntries(dashboard.channelDistribution || {}).slice(0, 5), function(entry) {
+    return { label: titleCase(entry[0]), value: entry[1] };
+  }, 'No channels yet');
+
+  var topIntents = sortedEntries(flattenCountMap(dashboard.intentDistribution || {})).slice(0, 6);
+  renderSimpleList('topIntentsList', topIntents, function(entry) {
+    return { label: entry[0], value: entry[1] };
+  }, 'No intents yet');
+
+  renderSimpleList('topTriggersList', safeArray(journeyIntel.topTriggers), function(item) {
+    return { label: item.trigger, value: item.count };
+  }, 'No triggers yet');
+
+  renderPathList('commonPathsList', safeArray(journeyIntel.commonPaths), 'No journey paths yet');
+  renderStuckJourneys(safeArray(journeyIntel.stuckJourneys));
+}
+
+function renderDistribution(containerId, data, labels) {
+  var node = byId(containerId);
+  clearChildren(node);
+  var flattened = flattenCountMap(data || {});
+  var entries = sortedEntries(flattened);
+  if (!entries.length) {
+    node.appendChild(el('div', 'muted', DEFAULT_EMPTY_TEXT));
+    return;
+  }
+  var max = entries[0][1] || 1;
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i];
+    var row = el('div', 'dist-row');
+    var label = el('div', 'dist-label', labels[entry[0]] || titleCase(entry[0]));
+    var track = el('div', 'dist-track');
+    var fill = el('div', 'dist-fill ' + entry[0]);
+    fill.style.width = String((entry[1] / max) * 100) + '%';
+    track.appendChild(fill);
+    var count = el('div', 'dist-count', String(entry[1]));
+    row.appendChild(label);
+    row.appendChild(track);
+    row.appendChild(count);
+    node.appendChild(row);
+  }
+}
+
+function renderSimpleList(containerId, items, formatter, emptyText) {
+  var node = byId(containerId);
+  clearChildren(node);
+  if (!items || !items.length) {
+    node.appendChild(el('div', 'muted', emptyText || DEFAULT_EMPTY_TEXT));
+    return;
+  }
+  for (var i = 0; i < items.length; i++) {
+    var formatted = formatter(items[i]);
+    var item = el('div', 'simple-item');
+    item.appendChild(el('span', null, formatted.label));
+    item.appendChild(el('span', null, String(formatted.value)));
+    node.appendChild(item);
+  }
+}
+
+function renderPathList(containerId, items, emptyText) {
+  var node = byId(containerId);
+  clearChildren(node);
+  if (!items || !items.length) {
+    node.appendChild(el('div', 'muted', emptyText || DEFAULT_EMPTY_TEXT));
+    return;
+  }
+  for (var i = 0; i < items.length; i++) {
+    var card = el('div', 'path-item');
+    card.appendChild(el('span', null, items[i].path));
+    card.appendChild(el('span', null, String(items[i].count)));
+    node.appendChild(card);
+  }
+}
+
+function renderStuckJourneys(items) {
+  var node = byId('stuckJourneysList');
+  clearChildren(node);
+  if (!items || !items.length) {
+    node.appendChild(el('div', 'muted', 'No at-risk journeys right now.'));
+    return;
+  }
+  for (var i = 0; i < items.length; i++) {
+    var journey = items[i];
+    var card = el('div', 'stuck-card');
+    card.appendChild(el('strong', null, titleCase(journey.journey_type)));
+    card.appendChild(el('div', 'detail-copy', 'Customer ' + journey.customer_id + ' is in ' + journey.current_state + '.'));
+    var meta = el('div', 'card-row');
+    meta.appendChild(renderPill(journey.sla_status, journey.sla_status === 'breached' ? 'danger' : 'warning'));
+    meta.appendChild(renderPill(formatMinutes(journey.minutes_in_state), 'info'));
+    meta.appendChild(renderPill(String(journey.cross_channel_handoffs) + ' handoffs', 'info'));
+    card.appendChild(meta);
+    node.appendChild(card);
+  }
+}
+
+function renderEvents() {
+  var node = byId('eventFeed');
+  clearChildren(node);
+  byId('eventCount').textContent = String(state.events.length);
+  if (!state.events.length) {
+    node.appendChild(el('div', 'empty-state', 'Waiting for live customer events. Use the simulator to send an interaction.'));
+    return;
+  }
+
+  for (var i = 0; i < state.events.length; i++) {
+    var event = state.events[i];
+    var card = el('article', 'event-card');
+
+    var top = el('div', 'card-top');
+    var left = el('div', 'left-inline');
+    var channel = el('span', 'channel-badge ' + (event.channel || 'web'), CHANNEL_LABELS[event.channel] || String(event.channel || 'EVENT').toUpperCase());
+    left.appendChild(channel);
+    if (event.classification && event.classification.domain) {
+      left.appendChild(el('span', 'domain-pill ' + event.classification.domain, event.classification.fullKey || event.classification.domain));
+    }
+    if (event.analysis && event.analysis.sentiment) {
+      left.appendChild(renderPill(event.analysis.sentiment, computeMoodClass(event.analysis.sentiment)));
+    }
+    if (event.analysis && event.analysis.urgency) {
+      left.appendChild(renderPill(event.analysis.urgency, computeUrgencyClass(event.analysis.urgency)));
+    }
+    if (event.routing && event.routing.should_deflect) {
+      left.appendChild(renderPill('deflect', 'success'));
+    }
+
+    var right = el('div', 'right-inline');
+    right.appendChild(el('span', 'timestamp', formatTime(event.timestamp)));
+    top.appendChild(left);
+    top.appendChild(right);
+    card.appendChild(top);
+
+    card.appendChild(el('div', 'event-header-label', 'Unified customer: ' + (event.unified_customer_id || event.customer_id || 'unknown')));
+    card.appendChild(el('div', 'event-message', shorten(event.content || 'No content available.', 180)));
+
+    var signals = el('div', 'card-row');
+    if (event.routing) {
+      signals.appendChild(renderPill('priority ' + formatNumber(event.routing.priority || 0), 'info'));
+      if (event.routing.sla_status) signals.appendChild(renderPill(event.routing.sla_status, event.routing.sla_status === 'breached' ? 'danger' : event.routing.sla_status === 'at_risk' ? 'warning' : 'success'));
+      if (event.routing.queue) signals.appendChild(el('span', 'queue-pill', event.routing.queue));
+      if (event.routing.estimated_wait_time !== undefined) signals.appendChild(renderPill('wait ' + formatMinutes(event.routing.estimated_wait_time), 'info'));
+    }
+    if (event.analysis && event.analysis.summary) {
+      signals.appendChild(renderPill(shorten(event.analysis.summary, 60), 'info'));
+    }
+    card.appendChild(signals);
+
+    if (safeArray(event.journey).length) {
+      var journeyList = el('div', 'detail-list');
+      for (var j = 0; j < event.journey.length; j++) {
+        var transition = event.journey[j];
+        var detail = el('div', 'detail-item');
+        detail.appendChild(el('span', null, titleCase(transition.journey_type || 'journey')));
+        detail.appendChild(el('span', null, (transition.from_state || 'start') + ' -> ' + (transition.to_state || '?')));
+        journeyList.appendChild(detail);
+      }
+      card.appendChild(journeyList);
+    }
+
+    if (safeArray(event.nba).length) {
+      var nbaList = el('div', 'nba-list');
+      for (var n = 0; n < event.nba.length; n++) {
+        var action = event.nba[n];
+        var item = el('div', 'nba-item');
+        item.appendChild(el('span', null, action.type || 'action'));
+        item.appendChild(renderPill(action.urgency || 'low', computeUrgencyClass(action.urgency || 'low')));
+        nbaList.appendChild(item);
+      }
+      card.appendChild(nbaList);
+    }
+
+    node.appendChild(card);
+  }
+}
+
+function renderInsights() {
+  var node = byId('insightFeed');
+  clearChildren(node);
+  byId('insightCount').textContent = String(state.insights.length);
+  if (!state.insights.length) {
+    node.appendChild(el('div', 'empty-state', 'LLM enrichment will appear here when available. The dashboard still shows deterministic routing and journey intelligence even without the model.'));
+    return;
+  }
+
+  for (var i = 0; i < state.insights.length; i++) {
+    var insight = state.insights[i];
+    var card = el('article', 'insight-card');
+    card.appendChild(el('strong', null, insight.type === 'llm_error' ? 'LLM enrichment error' : 'LLM enrichment'));
+    card.appendChild(el('div', 'timestamp', formatTime(insight.timestamp)));
+
+    if (insight.type === 'llm_error') {
+      card.appendChild(el('div', 'insight-text', (insight.data && insight.data.error) || 'Unknown error'));
+      node.appendChild(card);
+      continue;
+    }
+
+    var data = insight.data || {};
+    if (data.analysis && data.analysis.summary) {
+      card.appendChild(el('div', 'insight-text', data.analysis.summary));
+    }
+    var meta = el('div', 'card-row');
+    if (data.analysis && data.analysis.sentiment) meta.appendChild(renderPill(data.analysis.sentiment, computeMoodClass(data.analysis.sentiment)));
+    if (data.analysis && data.analysis.urgency) meta.appendChild(renderPill(data.analysis.urgency, computeUrgencyClass(data.analysis.urgency)));
+    if (data.classificationOverride) meta.appendChild(renderPill('classification override', 'warning'));
+    if (safeArray(data.analysis && data.analysis.topics).length) {
+      meta.appendChild(renderPill((data.analysis.topics || []).slice(0, 2).join(', '), 'info'));
+    }
+    card.appendChild(meta);
+    node.appendChild(card);
+  }
+}
+
+function renderCustomers() {
+  var body = byId('customerTableBody');
+  clearChildren(body);
+  byId('customerCount').textContent = state.customers.length + ' customers';
+  if (!state.customers.length) {
+    var row = el('tr');
+    var cell = el('td', 'muted', 'No customer profiles yet.');
+    cell.colSpan = 7;
+    row.appendChild(cell);
+    body.appendChild(row);
+    renderCustomerDetail(null);
+    return;
+  }
+
+  for (var i = 0; i < state.customers.length; i++) {
+    var profile = state.customers[i];
+    var row = el('tr', profile.customer_id === state.selectedCustomerId ? 'selected' : '');
+
+    var customerCell = el('td');
+    var button = el('button', 'customer-link', shorten(profile.customer_id, 20));
+    button.type = 'button';
+    button.addEventListener('click', createSelectCustomerHandler(profile.customer_id));
+    customerCell.appendChild(button);
+    customerCell.appendChild(el('div', 'table-subcopy', shorten((profile.attributes && profile.attributes.name) || 'Unified profile', 24)));
+    row.appendChild(customerCell);
+
+    row.appendChild(el('td', null, (profile.attributes && profile.attributes.customer_tier) || 'standard'));
+
+    var channelCell = el('td');
+    var channelTags = el('div', 'inline-tags');
+    var channels = getProfileChannels(profile);
+    for (var c = 0; c < channels.length; c++) {
+      channelTags.appendChild(el('span', 'channel-chip', channels[c]));
+    }
+    channelCell.appendChild(channelTags);
+    row.appendChild(channelCell);
+
+    row.appendChild(el('td', null, String(profile.interaction_count || 0)));
+    row.appendChild(el('td', null, String(getActiveJourneyCount(profile))));
+    row.appendChild(el('td', null, lastSentiment(profile)));
+    row.appendChild(el('td', null, formatTimeAgo(profile.last_seen)));
+    body.appendChild(row);
+  }
+
+  if (state.selectedCustomerId) {
+    var cached = state.customerDetails[state.selectedCustomerId];
+    if (cached) renderCustomerDetail(cached);
+  }
+}
+
+function createSelectCustomerHandler(customerId) {
+  return function() {
+    state.selectedCustomerId = customerId;
+    renderCustomers();
+    fetchSelectedCustomerDetail();
+  };
+}
+
+function renderCustomerDetail(detail) {
+  var pane = byId('customerDetailPane');
+  clearChildren(pane);
+  if (!detail || !detail.profile) {
+    pane.appendChild(el('div', 'empty-state', 'Select a customer to inspect aliases, journeys, sentiment history, and unified profile details.'));
+    return;
+  }
+
+  var profile = detail.profile;
+  var intelligence = detail.intelligence || {};
+  var journeys = safeArray(detail.journeys);
+  var sentimentHistory = safeArray(profile.sentiment_history).slice(-5).reverse();
+  var matchHistory = safeArray(profile.match_history).slice(-5).reverse();
+  var aliases = safeArray(profile.aliases);
+
+  var hero = el('section', 'detail-hero');
+  hero.appendChild(el('h3', 'detail-title', shorten(profile.customer_id, 28)));
+  hero.appendChild(el('div', 'detail-subtitle', ((profile.attributes && profile.attributes.name) || 'Unified customer') + ' · ' + ((profile.attributes && profile.attributes.customer_tier) || 'standard') + ' tier'));
+  var tags = el('div', 'inline-tags');
+  var channels = getProfileChannels(profile);
+  for (var i = 0; i < channels.length; i++) tags.appendChild(el('span', 'channel-chip', channels[i]));
+  if (profile.attributes && profile.attributes.segment) tags.appendChild(el('span', 'alias-chip', profile.attributes.segment));
+  hero.appendChild(tags);
+  pane.appendChild(hero);
+
+  var metrics = el('section', 'detail-card');
+  metrics.appendChild(el('h4', 'detail-heading', 'Profile summary'));
+  var metricGrid = el('div', 'detail-grid');
+  metricGrid.appendChild(createDetailMetric(profile.interaction_count || 0, 'Interactions'));
+  metricGrid.appendChild(createDetailMetric(aliases.length, 'Aliases'));
+  metricGrid.appendChild(createDetailMetric(getActiveJourneyCount(profile), 'Active journeys'));
+  metricGrid.appendChild(createDetailMetric(intelligence.crossChannelHandoffs || 0, 'Handoffs'));
+  metrics.appendChild(metricGrid);
+  metrics.appendChild(el('div', 'detail-copy', 'Email: ' + ((profile.attributes && profile.attributes.email) || 'n/a')));
+  metrics.appendChild(el('div', 'detail-copy', 'Phone: ' + ((profile.attributes && profile.attributes.phone) || 'n/a')));
+  pane.appendChild(metrics);
+
+  var aliasCard = el('section', 'detail-card');
+  aliasCard.appendChild(el('h4', 'detail-heading', 'Aliases and identifiers'));
+  var aliasWrap = el('div', 'inline-tags');
+  if (aliases.length) {
+    for (var a = 0; a < aliases.length; a++) aliasWrap.appendChild(el('span', 'alias-chip', aliases[a]));
+  } else {
+    aliasWrap.appendChild(el('span', 'alias-chip', 'No aliases'));
+  }
+  aliasCard.appendChild(aliasWrap);
+  pane.appendChild(aliasCard);
+
+  var journeysCard = el('section', 'detail-card');
+  journeysCard.appendChild(el('h4', 'detail-heading', 'Journeys'));
+  if (!journeys.length) {
+    journeysCard.appendChild(el('div', 'muted', 'No journeys for this profile yet.'));
+  } else {
+    var list = el('div', 'detail-list');
+    for (var j = 0; j < journeys.length; j++) {
+      var journey = journeys[j];
+      var item = el('div', 'detail-item');
+      item.appendChild(el('span', null, titleCase(journey.journey_type)));
+      item.appendChild(el('span', null, journey.current_state + ' · ' + (journey.sla_status || journey.status || 'active')));
+      list.appendChild(item);
+    }
+    journeysCard.appendChild(list);
+  }
+  pane.appendChild(journeysCard);
+
+  var intelCard = el('section', 'detail-card');
+  intelCard.appendChild(el('h4', 'detail-heading', 'Journey intelligence'));
+  var intelGrid = el('div', 'detail-grid');
+  intelGrid.appendChild(createDetailMetric(intelligence.activeJourneyCount || 0, 'Active'));
+  intelGrid.appendChild(createDetailMetric(intelligence.stuckJourneyCount || 0, 'At-risk'));
+  intelGrid.appendChild(createDetailMetric((intelligence.topTriggers && intelligence.topTriggers.length) || 0, 'Top triggers'));
+  intelGrid.appendChild(createDetailMetric((intelligence.commonPaths && intelligence.commonPaths.length) || 0, 'Paths'));
+  intelCard.appendChild(intelGrid);
+  pane.appendChild(intelCard);
+
+  var sentimentCard = el('section', 'detail-card');
+  sentimentCard.appendChild(el('h4', 'detail-heading', 'Sentiment history'));
+  if (!sentimentHistory.length) {
+    sentimentCard.appendChild(el('div', 'muted', 'No sentiment enrichment recorded yet.'));
+  } else {
+    var sentimentList = el('div', 'detail-list');
+    for (var s = 0; s < sentimentHistory.length; s++) {
+      var sentimentItem = el('div', 'detail-item');
+      sentimentItem.appendChild(el('span', null, sentimentHistory[s].sentiment || 'unknown'));
+      sentimentItem.appendChild(el('span', null, formatTimeAgo(sentimentHistory[s].timestamp)));
+      sentimentList.appendChild(sentimentItem);
+    }
+    sentimentCard.appendChild(sentimentList);
+  }
+  pane.appendChild(sentimentCard);
+
+  var matchCard = el('section', 'detail-card');
+  matchCard.appendChild(el('h4', 'detail-heading', 'Recent match history'));
+  if (!matchHistory.length) {
+    matchCard.appendChild(el('div', 'muted', 'No match history available.'));
+  } else {
+    var matchList = el('div', 'detail-list');
+    for (var m = 0; m < matchHistory.length; m++) {
+      var match = matchHistory[m];
+      var matchItem = el('div', 'detail-item');
+      matchItem.appendChild(el('span', null, match.strategy + ' · ' + formatNumber(match.confidence || 0)));
+      matchItem.appendChild(el('span', null, formatTimeAgo(match.timestamp)));
+      matchList.appendChild(matchItem);
+    }
+    matchCard.appendChild(matchList);
+  }
+  pane.appendChild(matchCard);
+}
+
+function createDetailMetric(value, label) {
+  var node = el('div', 'detail-metric');
+  node.appendChild(el('strong', null, String(value)));
+  node.appendChild(el('span', null, label));
+  return node;
+}
+
+function buildScenarioButtons() {
+  var grid = byId('scenarioGrid');
+  clearChildren(grid);
+  for (var i = 0; i < SCENARIOS.length; i++) {
+    var scenario = SCENARIOS[i];
+    var button = el('button', 'scenario-btn' + (scenario.wide ? ' wide' : ''));
+    button.type = 'button';
+    button.appendChild(el('strong', null, scenario.label));
+    button.appendChild(el('span', null, scenario.description));
+    button.addEventListener('click', createScenarioHandler(scenario.id));
+    grid.appendChild(button);
+  }
+}
+
+function createScenarioHandler(id) {
+  return function() {
+    runScenario(id);
+  };
+}
+
+function initEventListeners() {
+  byId('simForm').addEventListener('submit', function(event) {
+    event.preventDefault();
+    sendSimulatorEvent();
+  });
+  byId('generateTrafficBtn').addEventListener('click', generateTraffic);
+}
+
+function startPolling() {
+  if (state.pollingTimer) clearInterval(state.pollingTimer);
+  if (state.customerTimer) clearInterval(state.customerTimer);
+  state.pollingTimer = setInterval(function() { refreshAllData(false); }, 3500);
+  state.customerTimer = setInterval(function() { fetchSelectedCustomerDetail(); }, 5000);
+}
+
+function initEmptyState() {
+  renderEvents();
+  renderInsights();
+  renderCustomers();
+  renderDistribution('domainDist', {}, DOMAIN_LABELS);
+  renderDistribution('sentimentDist', {}, {});
+  renderDistribution('slaDist', {}, {});
+  renderSimpleList('topChannelsList', [], function() { return null; }, 'No channels yet');
+  renderSimpleList('topIntentsList', [], function() { return null; }, 'No intents yet');
+  renderSimpleList('topTriggersList', [], function() { return null; }, 'No triggers yet');
+  renderPathList('commonPathsList', [], 'No journey paths yet');
+  renderStuckJourneys([]);
+  renderCustomerDetail(null);
+}
+
+// ─── Health Polling ───
+var healthTimer = null;
+function pollHealth() {
+  fetchJson(API_BASE + '/api/health/ready').then(function(data) {
+    var dot = byId('healthDot');
+    var label = byId('healthStatus');
+    var status = data.status || 'unknown';
+    if (status === 'ready') {
+      dot.style.background = 'var(--success)';
+      label.innerHTML = '<span id="healthDot" style="width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block"></span> Ready';
+    } else if (status === 'degraded') {
+      dot.style.background = 'var(--warning)';
+      label.innerHTML = '<span id="healthDot" style="width:8px;height:8px;border-radius:50%;background:var(--warning);display:inline-block"></span> Degraded';
+    } else {
+      dot.style.background = 'var(--danger)';
+      label.innerHTML = '<span id="healthDot" style="width:8px;height:8px;border-radius:50%;background:var(--danger);display:inline-block"></span> Unhealthy';
+    }
+    // Update circuit breaker from health checks
+    if (data.checks && data.checks.ollama === false) {
+      updateCircuitBadge('open');
+    }
+  }).catch(function() {
+    var dot = byId('healthDot');
+    dot.style.background = 'var(--danger)';
+    byId('healthStatus').innerHTML = '<span id="healthDot" style="width:8px;height:8px;border-radius:50%;background:var(--danger);display:inline-block"></span> Offline';
+  });
+}
+
+function startHealthPolling() {
+  pollHealth();
+  healthTimer = setInterval(pollHealth, 30000);
+}
+
+// ─── Circuit Breaker Badge ───
+function updateCircuitBadge(embedState) {
+  var badge = byId('circuitBadge');
+  if (!badge) return;
+  var state = String(embedState || 'CLOSED').toLowerCase();
+  badge.className = 'circuit-badge ' + state;
+  if (state === 'open') {
+    badge.textContent = 'CB: Open';
+    badge.title = 'Ollama circuit breaker is OPEN — falling back to TF-IDF';
+  } else if (state === 'half_open') {
+    badge.textContent = 'CB: Probing';
+    badge.title = 'Ollama circuit breaker is probing recovery';
+  } else {
+    badge.textContent = 'CB: Closed';
+    badge.title = 'Ollama circuit breaker is healthy';
+  }
+}
+
+// ─── Sparklines ───
+var sparklineHistory = { contacts: [], events: [], sla: [] };
+
+function buildSparklineSVG(values) {
+  if (!values || values.length < 2) return '';
+  var width = 100;
+  var height = 28;
+  var max = Math.max.apply(null, values) || 1;
+  var min = Math.min.apply(null, values);
+  var range = max - min || 1;
+  var step = width / (values.length - 1);
+  var points = [];
+  for (var i = 0; i < values.length; i++) {
+    var x = Math.round(i * step * 10) / 10;
+    var y = Math.round((height - 2) - ((values[i] - min) / range) * (height - 4) + 2);
+    points.push(x + ',' + y);
+  }
+  var polyline = points.join(' ');
+  var areaPoints = '0,' + height + ' ' + polyline + ' ' + Math.round((values.length - 1) * step * 10) / 10 + ',' + height;
+  return '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">' +
+    '<polygon class="spark-area" points="' + areaPoints + '"/>' +
+    '<polyline class="spark-line" points="' + polyline + '"/>' +
+    '</svg>';
+}
+
+function renderSparkline(containerId, values) {
+  var container = byId(containerId);
+  if (!container) return;
+  container.innerHTML = buildSparklineSVG(values);
+}
+
+function fetchSparklineData() {
+  fetchJson(API_BASE + '/api/metrics/history?hours=1').then(function(data) {
+    var snapshots = safeArray(data.snapshots);
+    if (!snapshots.length) return;
+    // Take last 30 snapshots max for readable sparklines
+    var recent = snapshots.slice(-30);
+    var contactValues = [];
+    var slaValues = [];
+    for (var i = 0; i < recent.length; i++) {
+      var kpis = recent[i].kpis || {};
+      contactValues.push(kpis.total_contacts || 0);
+      slaValues.push(kpis.sla_compliance_rate || 0);
+    }
+    sparklineHistory.contacts = contactValues;
+    sparklineHistory.sla = slaValues;
+    renderSparkline('sparkContacts', sparklineHistory.contacts);
+    renderSparkline('sparkSla', sparklineHistory.sla);
+  }).catch(function() {});
+
+  // Also use in-memory timeseries for events sparkline
+  fetchJson(API_BASE + '/api/metrics/timeseries?bucket=60000').then(function(data) {
+    var buckets = safeArray(data);
+    if (!buckets.length) return;
+    var recent = buckets.slice(-30);
+    var values = [];
+    for (var i = 0; i < recent.length; i++) {
+      values.push(recent[i].count || 0);
+    }
+    sparklineHistory.events = values;
+    renderSparkline('sparkEvents', sparklineHistory.events);
+  }).catch(function() {});
+}
+
+function startSparklinePolling() {
+  fetchSparklineData();
+  setInterval(fetchSparklineData, 60000);
+}
+
+// ─── Pipeline Latency ───
+function updateLatencyPanel(dashboard) {
+  var latency = (dashboard && dashboard.latency) || (dashboard && dashboard.pipelineLatency) || {};
+  var identityEl = byId('latencyIdentity');
+  var totalEl = byId('latencyTotal');
+  var countEl = byId('latencyCount');
+  if (!identityEl) return;
+
+  if (latency.avgIdentityMs !== undefined) {
+    identityEl.textContent = formatNumber(latency.avgIdentityMs) + 'ms';
+  }
+  if (latency.avgTotalMs !== undefined) {
+    totalEl.textContent = formatNumber(latency.avgTotalMs) + 'ms';
+  }
+  if (latency.eventsProcessed !== undefined) {
+    countEl.textContent = formatNumber(latency.eventsProcessed);
+  }
+}
+
+// ─── SLA Alert Banner ───
+var slaAlertTimeout = null;
+function showSlaAlert(message) {
+  var banner = byId('slaAlertBanner');
+  var text = byId('slaAlertText');
+  if (!banner) return;
+  text.textContent = message || 'SLA breach detected — immediate attention required';
+  banner.className = 'sla-alert-banner visible';
+  if (slaAlertTimeout) clearTimeout(slaAlertTimeout);
+  slaAlertTimeout = setTimeout(function() {
+    banner.className = 'sla-alert-banner';
+  }, 15000);
+}
+
+function checkSlaBreaches(event) {
+  if (!event) return;
+  var routing = event.routing || {};
+  if (routing.sla_status === 'breached') {
+    var customer = event.unified_customer_id || event.customer_id || 'unknown';
+    showSlaAlert('SLA breach for customer ' + customer + ' on ' + (event.channel || 'unknown') + ' channel');
+  }
+}
+
+// ─── Export Functions ───
+function downloadFile(content, filename, mimeType) {
+  var blob = new Blob([content], { type: mimeType });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function exportMetricsCsv() {
+  fetchJson(API_BASE + '/api/events/export?format=csv').then(function(data) {
+    downloadFile(data.csv || String(data), 'cx-events-' + new Date().toISOString().slice(0, 10) + '.csv', 'text/csv');
+  }).catch(function() {
+    // Fallback: build CSV from current dashboard
+    var dashboard = state.dashboard || {};
+    var kpis = dashboard.kpis || {};
+    var rows = ['metric,value'];
+    rows.push('total_contacts,' + (kpis.total_contacts || 0));
+    rows.push('sla_compliance_rate,' + (kpis.sla_compliance_rate || 0));
+    rows.push('avg_wait_time,' + (kpis.avg_wait_time || 0));
+    rows.push('deflection_rate,' + (kpis.deflection_rate || 0));
+    rows.push('avg_contact_value,' + (kpis.avg_contact_value || 0));
+    rows.push('high_priority_contacts,' + (kpis.high_priority_contacts || 0));
+    downloadFile(rows.join('\n'), 'cx-metrics-' + new Date().toISOString().slice(0, 10) + '.csv', 'text/csv');
+  });
+}
+
+function exportMetricsJson() {
+  var dashboard = state.dashboard || {};
+  downloadFile(JSON.stringify(dashboard, null, 2), 'cx-metrics-' + new Date().toISOString().slice(0, 10) + '.json', 'application/json');
+}
+
+function exportEventsCsv() {
+  var rows = ['timestamp,channel,customer_id,domain,intent,sentiment,urgency,priority,sla_status'];
+  for (var i = 0; i < state.events.length; i++) {
+    var e = state.events[i];
+    var cls = e.classification || {};
+    var analysis = e.analysis || {};
+    var routing = e.routing || {};
+    rows.push([
+      e.timestamp || '',
+      e.channel || '',
+      e.unified_customer_id || e.customer_id || '',
+      cls.domain || '',
+      cls.fullKey || '',
+      analysis.sentiment || '',
+      analysis.urgency || '',
+      routing.priority || 0,
+      routing.sla_status || ''
+    ].join(','));
+  }
+  downloadFile(rows.join('\n'), 'cx-events-' + new Date().toISOString().slice(0, 10) + '.csv', 'text/csv');
+}
+
+function exportEventsJson() {
+  downloadFile(JSON.stringify(state.events, null, 2), 'cx-events-' + new Date().toISOString().slice(0, 10) + '.json', 'application/json');
+}
+
+function initExportButtons() {
+  byId('exportMetricsCsv').addEventListener('click', exportMetricsCsv);
+  byId('exportMetricsJson').addEventListener('click', exportMetricsJson);
+  byId('exportEventsCsv').addEventListener('click', exportEventsCsv);
+  byId('exportEventsJson').addEventListener('click', exportEventsJson);
+  byId('slaAlertDismiss').addEventListener('click', function() {
+    byId('slaAlertBanner').className = 'sla-alert-banner';
+  });
+}
+
+function init() {
+  buildScenarioButtons();
+  initEventListeners();
+  initExportButtons();
+  initEmptyState();
+  updateConnectionUI(false);
+  updateLastRefreshLabel();
+  connectWebSocket();
+  refreshAllData(true);
+  startPolling();
+  startHealthPolling();
+  startSparklinePolling();
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
