@@ -15,7 +15,7 @@
   "dependencies": {
     "better-sqlite3": "^12.10.0",
     "cors": "^2.8.5",
-    "express": "^4.21.0",
+    "express": "^5.2.1",
     "express-rate-limit": "^8.5.2",
     "helmet": "^8.2.0",
     "pino": "^10.3.1",
