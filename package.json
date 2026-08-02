@@ -13,7 +13,7 @@
     "health": "curl -s http://localhost:3143/api/health/ready | node -e \"process.stdin.on('data',d=>{const h=JSON.parse(d);console.log(h.status,'-',JSON.stringify(h.checks))})\""
   },
   "dependencies": {
-    "better-sqlite3": "^12.10.0",
+    "better-sqlite3": "^12.11.1",
     "cors": "^2.8.5",
     "express": "^4.21.0",
     "express-rate-limit": "^8.5.2",
